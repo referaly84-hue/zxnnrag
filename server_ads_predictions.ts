@@ -20,7 +20,7 @@ export const ADSGRAM_BLOCKS: AdsgramBlockDef[] = [
     format: 'long',
     durationSec: 30,
     requiresClick: false,
-    defaultBlockId: 'int-sponsor-long',
+    defaultBlockId: '60557',
     maxPerCycle: 10,
   },
   {
@@ -30,7 +30,7 @@ export const ADSGRAM_BLOCKS: AdsgramBlockDef[] = [
     format: 'short',
     durationSec: 5,
     requiresClick: false,
-    defaultBlockId: 'int-sponsor-short',
+    defaultBlockId: 'int-60559',
     maxPerCycle: 10,
   },
   {
@@ -40,7 +40,7 @@ export const ADSGRAM_BLOCKS: AdsgramBlockDef[] = [
     format: 'banner',
     durationSec: 5,
     requiresClick: false,
-    defaultBlockId: 'int-sponsor-banner',
+    defaultBlockId: 'task-60558',
     maxPerCycle: 10,
   },
   {
@@ -50,7 +50,7 @@ export const ADSGRAM_BLOCKS: AdsgramBlockDef[] = [
     format: 'long',
     durationSec: 15,
     requiresClick: false,
-    defaultBlockId: 'int-rfs-bonus',
+    defaultBlockId: '60560',
     maxPerCycle: 30,
   },
   {
@@ -60,7 +60,7 @@ export const ADSGRAM_BLOCKS: AdsgramBlockDef[] = [
     format: 'click_long',
     durationSec: 30,
     requiresClick: true,
-    defaultBlockId: 'int-friendly-req',
+    defaultBlockId: '60564',
     maxPerCycle: 9,
   },
   {
@@ -70,7 +70,7 @@ export const ADSGRAM_BLOCKS: AdsgramBlockDef[] = [
     format: 'short',
     durationSec: 10,
     requiresClick: false,
-    defaultBlockId: 'int-friendly-acc',
+    defaultBlockId: 'int-60565',
     maxPerCycle: 30,
   },
   {
@@ -80,7 +80,7 @@ export const ADSGRAM_BLOCKS: AdsgramBlockDef[] = [
     format: 'short',
     durationSec: 5,
     requiresClick: false,
-    defaultBlockId: 'int-coins-short',
+    defaultBlockId: 'int-60561',
     maxPerCycle: 30,
   },
   {
@@ -90,7 +90,7 @@ export const ADSGRAM_BLOCKS: AdsgramBlockDef[] = [
     format: 'banner',
     durationSec: 5,
     requiresClick: false,
-    defaultBlockId: 'int-coins-banner',
+    defaultBlockId: 'task-60562',
     maxPerCycle: 30,
   },
   {
@@ -100,7 +100,7 @@ export const ADSGRAM_BLOCKS: AdsgramBlockDef[] = [
     format: 'long',
     durationSec: 30,
     requiresClick: false,
-    defaultBlockId: 'int-coins-long',
+    defaultBlockId: '60563',
     maxPerCycle: 30,
   },
   {
@@ -110,7 +110,7 @@ export const ADSGRAM_BLOCKS: AdsgramBlockDef[] = [
     format: 'short',
     durationSec: 10,
     requiresClick: false,
-    defaultBlockId: 'int-nt-prop-player',
+    defaultBlockId: '60566',
     maxPerCycle: 30,
   },
   {
@@ -120,7 +120,7 @@ export const ADSGRAM_BLOCKS: AdsgramBlockDef[] = [
     format: 'short',
     durationSec: 5,
     requiresClick: false,
-    defaultBlockId: 'int-nt-vote-player',
+    defaultBlockId: 'int-60568',
     maxPerCycle: 30,
   },
   {
@@ -130,7 +130,7 @@ export const ADSGRAM_BLOCKS: AdsgramBlockDef[] = [
     format: 'short',
     durationSec: 10,
     requiresClick: false,
-    defaultBlockId: 'int-nt-prop-opp',
+    defaultBlockId: '60567',
     maxPerCycle: 30,
   },
   {
@@ -140,7 +140,7 @@ export const ADSGRAM_BLOCKS: AdsgramBlockDef[] = [
     format: 'short',
     durationSec: 5,
     requiresClick: false,
-    defaultBlockId: 'int-nt-vote-opp',
+    defaultBlockId: 'int-60569',
     maxPerCycle: 30,
   },
   {
@@ -150,7 +150,7 @@ export const ADSGRAM_BLOCKS: AdsgramBlockDef[] = [
     format: 'short',
     durationSec: 5,
     requiresClick: false,
-    defaultBlockId: 'int-interview-ask',
+    defaultBlockId: 'int-60570',
     maxPerCycle: 50,
   },
 ];
@@ -1453,7 +1453,7 @@ function pruneAdSessions() {
 
 export function isConfiguredAdsgramBlockId(def: AdsgramBlockDef | undefined, rawBlockId: string): boolean {
   const v = String(rawBlockId || '').trim();
-  if (!def || !v || v === def.defaultBlockId) return false;
+  if (!def || !v) return false;
   return /^\d+$/.test(v) || /^task-\d+$/i.test(v) || /^int-\d+$/i.test(v);
 }
 
@@ -1502,7 +1502,8 @@ export function getAdsgramBlocks(db: any): Record<string, string> {
   const saved = db.settings.adsgramBlocks && typeof db.settings.adsgramBlocks === 'object' ? db.settings.adsgramBlocks : {};
   const out: Record<string, string> = {};
   for (const b of ADSGRAM_BLOCKS) {
-    out[b.key] = String(saved[b.key] || b.defaultBlockId).trim() || b.defaultBlockId;
+    const candidate = String(saved[b.key] || '').trim();
+    out[b.key] = isConfiguredAdsgramBlockId(b, candidate) ? candidate : b.defaultBlockId;
   }
   return out;
 }
@@ -2747,7 +2748,8 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
     const actor = resolveActor(req);
     const hints = extractTgHintsFromReq(ctx, req);
     const tgId = String(hints.tgId || '').replace(/[^0-9]/g, '');
-    if (db.settings?.requireAdsgramS2S && !tgId) {
+    const supportsS2S = !blockId.toLowerCase().startsWith('int-');
+    if (db.settings?.requireAdsgramS2S && supportsS2S && !tgId) {
       return ctx.fail(res, 'Для строгой S2S-проверки просмотра рекламы откройте игру внутри Telegram Mini App.');
     }
 
@@ -2810,7 +2812,7 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
       format: def.format,
       durationSec: def.durationSec,
       requiresClick: def.requiresClick,
-      requireS2S: !!db.settings?.requireAdsgramS2S,
+      requireS2S: !!db.settings?.requireAdsgramS2S && supportsS2S,
     });
   });
 
@@ -2875,7 +2877,7 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
       return ctx.fail(res, 'Необходимо полностью завершить показ рекламного предложения.');
     }
 
-    if (db.settings?.requireAdsgramS2S) {
+    if (db.settings?.requireAdsgramS2S && !s.blockId.toLowerCase().startsWith('int-')) {
       const s2sOk = !!s.s2sConfirmed || consumeSdkS2SReward(s.tgId, s.blockId, s.startedAt);
       if (!s2sOk) {
         adSessions.delete(token);
