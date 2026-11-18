@@ -29,7 +29,8 @@ declare global {
     } | null;
     Adsgram?: {
       init: (opts: { blockId: string }) => {
-        show: () => Promise<{ done?: boolean; state?: string; description?: string }>;
+        show: () => Promise<{ done?: boolean; error?: boolean; state?: string; description?: string }>;
+        addEventListener?: (event: string, cb: (e?: any) => void) => void;
       };
     };
     Telegram?: any;
@@ -974,184 +975,123 @@ function fmtShortCooldown(ms: number): string {
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
+function isRealConfiguredSdkBlockId(blockId: string): boolean {
+  const v = String(blockId || '').trim();
+  return /^\d+$/.test(v) || /^task-\d+$/i.test(v) || /^int-\d+$/i.test(v);
+}
+
+async function waitForAdsgramSdk(timeoutMs = 1500): Promise<boolean> {
+  if (typeof window.Adsgram?.init === 'function') return true;
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    await new Promise((r) => setTimeout(r, 120));
+    if (typeof window.Adsgram?.init === 'function') return true;
+  }
+  return typeof window.Adsgram?.init === 'function';
+}
+
 /**
- * Executes an Adsgram ad block:
- * - Uses native window.Adsgram.init({ blockId }).show() when SDK is available & real numeric/task blockId is configured.
- * - Falls back to an interactive Adsgram Ad Player modal in web/preview environments, enforcing duration & optional click-through.
+ * Executes an Adsgram ad block with strict real SDK verification:
+ * - Never fakes an ad view when blocks are unconfigured or Adsgram SDK is unavailable.
+ * - Verifies ShowPromiseResult.done === true && !error and confirms completion on server.
  */
 export async function runAdsgramBlock(
   blockKey: string,
-  title: string,
-  subtitle?: string
+  _title: string,
+  _subtitle?: string
 ): Promise<{ adProof: string; blockKey: string; clicked: boolean } | null> {
-  const { api, e, toast, modal } = B();
+  const { api, toast } = B();
   let session: any;
   try {
     session = await api('/ads/start', { blockKey });
   } catch (err: any) {
-    toast(err?.message || 'Не удалось запустить рекламный блок', true);
+    toast(err?.message || 'Не удалось запустить рекламный блок Adsgram', true);
     return null;
   }
 
-  const blockId = String(session.blockId || '');
-  const requiresClick = !!session.requiresClick;
-  const isRealAdsgramBlock = typeof window.Adsgram?.init === 'function' && (/^\d+$/.test(blockId) || blockId.startsWith('task-'));
-
-  if (isRealAdsgramBlock) {
-    try {
-      const controller = window.Adsgram!.init({ blockId });
-      const res = await controller.show();
-      const completed = await api('/ads/complete', {
-        sessionToken: session.sessionToken,
-        clicked: requiresClick ? true : !!res?.done,
-        sdkCompleted: true,
-      });
-      return { adProof: completed.adProof, blockKey, clicked: !!completed.clicked };
-    } catch (err: any) {
-      toast(err?.description || err?.message || 'Просмотр рекламы Adsgram отменён', true);
-      return null;
+  const blockId = String(session?.blockId || '').trim();
+  const sessionToken = String(session?.sessionToken || '').trim();
+  const cancelSession = () => {
+    if (sessionToken) {
+      api('/ads/cancel', { sessionToken }).catch(() => {});
     }
+  };
+
+  if (!isRealConfiguredSdkBlockId(blockId)) {
+    cancelSession();
+    toast(`Рекламный блок «${blockId || blockKey}» ещё не настроен. Укажите реальный Block ID в Админке.`, true);
+    return null;
   }
 
-  const previewSec = session.format === 'long' || session.format === 'click_long' ? 6 : 4;
-  return new Promise((resolve) => {
-    let resolved = false;
-    let timerId: any = null;
-    let remaining = previewSec;
-    let clickedAd = false;
+  const sdkReady = await waitForAdsgramSdk(1500);
+  if (!sdkReady || typeof window.Adsgram?.init !== 'function') {
+    cancelSession();
+    toast('Рекламный SDK Adsgram не загружен. Отключите блокировщик рекламы или откройте игру в Telegram Mini App.', true);
+    return null;
+  }
 
-    let observer: MutationObserver | null = null;
+  let controller: any;
+  try {
+    controller = window.Adsgram.init({ blockId });
+  } catch (err: any) {
+    cancelSession();
+    toast(err?.message || 'Не удалось инициализировать блок Adsgram', true);
+    return null;
+  }
 
-    const finishResolve = (val: { adProof: string; blockKey: string; clicked: boolean } | null) => {
-      if (resolved) return;
-      resolved = true;
-      if (timerId) clearInterval(timerId);
-      if (observer) observer.disconnect();
-      resolve(val);
-    };
+  let eventError: string | null = null;
+  let bannerNotFound = false;
+  let skipped = false;
+  let rewardEventFired = false;
 
-    const html = `
-      <div style="max-width:460px;margin:0 auto">
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px">
-          <div style="font-size:12px;font-weight:700;color:#5b7064">Adsgram Network · Блок <code>${e(blockId)}</code></div>
-          <span id="ad_timer_badge" style="font-variant-numeric:tabular-nums;font-size:12px;font-weight:700;color:#0d2f21;background:#fef3c7;padding:3px 9px;border-radius:6px">${remaining} сек</span>
-        </div>
-        <h3 style="margin:0 0 6px;font-size:17px">${e(title)}</h3>
-        ${subtitle ? `<div class="small muted" style="margin-bottom:12px">${e(subtitle)}</div>` : ''}
-        <div style="background:linear-gradient(135deg,#0d2f21 0%,#1b5c3f 100%);color:#fff;border-radius:10px;padding:18px;margin-bottom:12px;border:1px solid #2f7d55">
-          <div style="font-size:11px;color:#cfe3d6;margin-bottom:6px">${session.format === 'banner' ? 'Рекламный баннер' : session.format === 'click_long' ? 'Большой рекламный ролик (требуется переход)' : session.format === 'long' ? 'Длинный видеоролик (30с)' : 'Короткий видеоролик (5с)'}</div>
-          <div style="font-weight:700;font-size:16px;margin-bottom:6px">Официальная реклама партнёров лиги</div>
-          <div style="font-size:13px;color:#e8eee9;line-height:1.45;margin-bottom:12px">
-            ${requiresClick
-              ? 'Для подачи заявки на товарищеский матч дождитесь окончания таймера и обязательно нажмите на рекламное предложение ниже.'
-              : 'Дождитесь завершения просмотра рекламного блока, чтобы получить награду.'}
-          </div>
-          <div style="height:6px;background:rgba(255,255,255,0.2);border-radius:99px;overflow:hidden;margin-bottom:${requiresClick ? '12px' : '0'}">
-            <div id="ad_prog_bar" style="height:100%;width:0%;background:#f0c419;transition:width 0.35s linear"></div>
-          </div>
-          ${requiresClick ? `
-            <button type="button" id="ad_click_cta" class="btn" style="width:100%;background:#f0c419;color:#0d2f21;font-weight:700;min-height:44px">
-              Перейти по рекламе (обязательный клик)
-            </button>
-            <div id="ad_click_status" style="font-size:12px;color:#fef08a;margin-top:6px;text-align:center">Клик по рекламе ещё не выполнен</div>
-          ` : ''}
-        </div>
-        <div class="row" style="gap:8px;justify-content:flex-end">
-          <button type="button" id="ad_cancel_btn" class="btn alt sm" style="min-height:42px">Отмена</button>
-          <button type="button" id="ad_done_btn" class="btn sm" disabled style="min-height:42px;opacity:0.55">Подождите (${remaining}с)</button>
-        </div>
-        <div class="small muted" style="margin-top:8px;font-size:11px">В Telegram Mini App здесь запускается нативный контроллер Adsgram с Block ID «${e(blockId)}».</div>
-      </div>
-    `;
-
-    modal(html, (el, close) => {
-      const closeModal = typeof close === 'function' ? close : () => el.remove();
-      const timerBadge = el.querySelector('#ad_timer_badge') as HTMLElement;
-      const progBar = el.querySelector('#ad_prog_bar') as HTMLElement;
-      const doneBtn = el.querySelector('#ad_done_btn') as HTMLButtonElement;
-      const cancelBtn = el.querySelector('#ad_cancel_btn') as HTMLButtonElement;
-      const ctaBtn = el.querySelector('#ad_click_cta') as HTMLButtonElement | null;
-      const clickStatus = el.querySelector('#ad_click_status') as HTMLElement | null;
-
-      const syncDoneState = () => {
-        const timerReady = remaining <= 0;
-        const clickReady = !requiresClick || clickedAd;
-        if (timerReady && clickReady) {
-          doneBtn.disabled = false;
-          doneBtn.style.opacity = '1';
-          doneBtn.textContent = 'Подтвердить просмотр';
-        } else if (timerReady && !clickReady) {
-          doneBtn.disabled = true;
-          doneBtn.style.opacity = '0.55';
-          doneBtn.textContent = 'Нажмите по рекламе выше';
-        } else {
-          doneBtn.disabled = true;
-          doneBtn.style.opacity = '0.55';
-          doneBtn.textContent = `Подождите (${remaining}с)`;
-        }
-      };
-
-      if (ctaBtn) {
-        ctaBtn.onclick = () => {
-          clickedAd = true;
-          ctaBtn.textContent = 'Переход выполнен ✓';
-          ctaBtn.style.background = '#bbf7d0';
-          if (clickStatus) {
-            clickStatus.textContent = 'Клик по рекламе подтверждён ✓';
-            clickStatus.style.color = '#86efac';
-          }
-          syncDoneState();
-        };
-      }
-
-      const updateProgress = () => {
-        const pct = Math.min(100, Math.round(((previewSec - remaining) / previewSec) * 100));
-        if (progBar) progBar.style.width = `${pct}%`;
-        if (timerBadge) timerBadge.textContent = remaining > 0 ? `${remaining} сек` : 'Готово';
-        syncDoneState();
-      };
-
-      updateProgress();
-      timerId = setInterval(() => {
-        remaining = Math.max(0, remaining - 1);
-        updateProgress();
-        if (remaining <= 0) {
-          clearInterval(timerId);
-          timerId = null;
-        }
-      }, 1000);
-
-      cancelBtn.onclick = () => {
-        closeModal();
-        finishResolve(null);
-      };
-
-      doneBtn.onclick = async () => {
-        doneBtn.disabled = true;
-        doneBtn.textContent = 'Проверка…';
-        try {
-          const completed = await api('/ads/complete', {
-            sessionToken: session.sessionToken,
-            clicked: clickedAd,
-            sdkCompleted: false,
-          });
-          closeModal();
-          finishResolve({ adProof: completed.adProof, blockKey, clicked: !!completed.clicked });
-        } catch (err: any) {
-          toast(err?.message || 'Ошибка подтверждения рекламы', true);
-          doneBtn.disabled = false;
-          syncDoneState();
-        }
-      };
-
-      observer = new MutationObserver(() => {
-        if (!document.body.contains(el)) {
-          finishResolve(null);
-        }
+  try {
+    if (typeof controller?.addEventListener === 'function') {
+      controller.addEventListener('onBannerNotFound', () => {
+        bannerNotFound = true;
+        eventError = 'Реклама Adsgram сейчас не подобрана для показа. Попробуйте чуть позже.';
       });
-      observer.observe(document.body, { childList: true, subtree: true });
+      controller.addEventListener('onError', (ev: any) => {
+        eventError = String(ev?.description || 'Ошибка показа рекламы Adsgram.');
+      });
+      controller.addEventListener('onSkip', () => {
+        skipped = true;
+      });
+      controller.addEventListener('onReward', () => {
+        rewardEventFired = true;
+      });
+    }
+  } catch {}
+
+  try {
+    const res = await controller.show();
+    const isDone = Boolean(res && res.done === true && !res.error && !bannerNotFound && !skipped);
+    if (!isDone) {
+      cancelSession();
+      toast(
+        eventError ||
+          res?.description ||
+          (skipped ? 'Реклама пропущена — просмотр не засчитан.' : 'Реклама Adsgram не была досмотрена до конца.'),
+        true
+      );
+      return null;
+    }
+
+    const completed = await api('/ads/complete', {
+      sessionToken,
+      clicked: true,
+      sdkCompleted: true,
+      done: true,
+      error: false,
+      state: String(res?.state || ''),
+      description: String(res?.description || ''),
+      rewardEventFired,
     });
-  });
+    return { adProof: completed.adProof, blockKey, clicked: !!completed.clicked };
+  } catch (err: any) {
+    cancelSession();
+    toast(eventError || err?.description || err?.message || 'Просмотр рекламы Adsgram не выполнен или отменён', true);
+    return null;
+  }
 }
 
 export async function runAdsgramBotBlock(
@@ -1164,7 +1104,7 @@ export async function runAdsgramBotBlock(
   try {
     startRes = await api('/ads/bot/start', { blockKey });
   } catch (err: any) {
-    toast(err?.message || 'Не удалось запустить рекламу в боте', true);
+    toast(err?.message || 'Не удалось запустить рекламу в Telegram-боте', true);
     return null;
   }
 
@@ -1201,198 +1141,84 @@ export async function runAdsgramBotBlock(
     });
   }
 
-  if (startRes?.mode === 'bot_sent') {
-    const botUser = String(startRes.botUsername || '').replace(/^@/, '');
-    const botUrl = botUser ? `https://t.me/${botUser}` : '';
-    const sessionToken = String(startRes.sessionToken || '');
-    return new Promise((resolve) => {
-      let resolved = false;
-      let pollId: any = null;
-      let observer: MutationObserver | null = null;
-      const finish = (val: any) => {
-        if (resolved) return;
-        resolved = true;
-        if (pollId) clearInterval(pollId);
-        if (observer) observer.disconnect();
-        resolve(val);
-      };
-
-      const html = `
-        <div style="max-width:460px;margin:0 auto">
-          <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px">
-            <span style="font-size:12px;font-weight:700;color:#0369a1">Telegram-бот · Adsgram Блок <code>${e(startRes.blockId || '')}</code></span>
-            <span id="bot_wait_badge" style="font-size:12px;font-weight:700;color:#0d2f21;background:#dbeafe;padding:3px 9px;border-radius:6px">Ожидание перехода…</span>
-          </div>
-          <h3 style="margin:0 0 6px;font-size:17px">${e(title)}</h3>
-          ${subtitle ? `<div class="small muted" style="margin-bottom:10px">${e(subtitle)}</div>` : ''}
-          <div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:10px;padding:14px;margin-bottom:12px;font-size:13.5px;line-height:1.5;color:#0c4a6e">
-            <b>Рекламный пост отправлен в личные сообщения Telegram-бота!</b>
-            <ol style="margin:8px 0 0;padding-left:18px">
-              <li>Откройте чат с ботом${botUser ? ` (@${e(botUser)})` : ''}.</li>
-              <li>Нажмите на первую рекламную кнопку в сообщении.</li>
-              <li>Вернитесь к сообщению и нажмите кнопку подтверждения награды.</li>
-            </ol>
-          </div>
-          <div class="row" style="gap:8px;flex-wrap:wrap;justify-content:flex-end">
-            ${botUrl ? `<a href="${e(botUrl)}" target="_blank" rel="noopener" class="btn sm" style="min-height:42px;display:inline-flex;align-items:center">Открыть чат с ботом</a>` : ''}
-            <button type="button" id="bot_check_now" class="btn alt sm" style="min-height:42px">Проверить статус</button>
-            <button type="button" id="bot_wait_cancel" class="btn alt sm" style="min-height:42px">Закрыть</button>
-          </div>
-        </div>
-      `;
-
-      modal(html, (el, close) => {
-        const closeModal = typeof close === 'function' ? close : () => el.remove();
-        const badge = el.querySelector('#bot_wait_badge') as HTMLElement | null;
-        const checkBtn = el.querySelector('#bot_check_now') as HTMLButtonElement;
-        const cancelBtn = el.querySelector('#bot_wait_cancel') as HTMLButtonElement;
-
-        const checkStatus = async (manual = false) => {
-          try {
-            const st = await api(`/ads/bot/status?sessionToken=${encodeURIComponent(sessionToken)}`);
-            if (st?.consumed && st?.creditResult) {
-              closeModal();
-              finish({ blockKey, clicked: true, alreadyCredited: true, creditResult: st.creditResult });
-              return true;
-            }
-            if (st?.expired) {
-              if (badge) badge.textContent = 'Истекло';
-              toast('Срок ожидания рекламного сообщения истёк.', true);
-              closeModal();
-              finish(null);
-              return true;
-            }
-            if (manual) {
-              toast('Переход и подтверждение награды в боте ещё не зафиксированы.', true);
-            }
-          } catch {}
-          return false;
-        };
-
-        pollId = setInterval(() => { checkStatus(false); }, 2500);
-        checkBtn.onclick = () => { checkStatus(true); };
-        cancelBtn.onclick = () => { closeModal(); finish(null); };
-
-        observer = new MutationObserver(() => {
-          if (!document.body.contains(el)) finish(null);
-        });
-        observer.observe(document.body, { childList: true, subtree: true });
-      });
-    });
+  if (startRes?.mode !== 'bot_sent' || !startRes?.sessionToken) {
+    toast(startRes?.error || 'Реклама в Telegram-боте недоступна: блок не настроен или отсутствует связь с ботом.', true);
+    return null;
   }
 
-  // Preview mode (when bot token / publisher token / numeric block ID / tgId is not active yet)
-  const sessionToken = String(startRes?.sessionToken || '');
-  const blockId = String(startRes?.blockId || blockKey);
+  const botUser = String(startRes.botUsername || '').replace(/^@/, '');
+  const botUrl = botUser ? `https://t.me/${botUser}` : '';
+  const sessionToken = String(startRes.sessionToken || '');
   return new Promise((resolve) => {
     let resolved = false;
-    let timerId: any = null;
-    let remaining = 3;
-    let clickedAd = false;
+    let pollId: any = null;
     let observer: MutationObserver | null = null;
-    const finishResolve = (val: any) => {
+    const finish = (val: any) => {
       if (resolved) return;
       resolved = true;
-      if (timerId) clearInterval(timerId);
+      if (pollId) clearInterval(pollId);
       if (observer) observer.disconnect();
       resolve(val);
     };
 
     const html = `
       <div style="max-width:460px;margin:0 auto">
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px">
-          <div style="font-size:12px;font-weight:700;color:#0369a1">Adsgram Бот · Блок <code>${e(blockId)}</code></div>
-          <span id="bot_pv_timer" style="font-variant-numeric:tabular-nums;font-size:12px;font-weight:700;color:#0d2f21;background:#fef3c7;padding:3px 9px;border-radius:6px">${remaining} сек</span>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px">
+          <span style="font-size:12px;font-weight:700;color:#0369a1">Telegram-бот · Adsgram Блок <code>${e(startRes.blockId || '')}</code></span>
+          <span id="bot_wait_badge" style="font-size:12px;font-weight:700;color:#0d2f21;background:#dbeafe;padding:3px 9px;border-radius:6px">Ожидание перехода…</span>
         </div>
         <h3 style="margin:0 0 6px;font-size:17px">${e(title)}</h3>
-        ${subtitle ? `<div class="small muted" style="margin-bottom:12px">${e(subtitle)}</div>` : ''}
-        <div style="background:linear-gradient(135deg,#0c4a6e 0%,#0f766e 100%);color:#fff;border-radius:12px;padding:16px;margin-bottom:12px;border:1px solid #38bdf8">
-          <div style="font-size:11px;color:#bae6fd;margin-bottom:6px">Предпросмотр сообщения в Telegram-боте</div>
-          <div style="font-weight:700;font-size:15.5px;margin-bottom:6px">Партнёрский пост в личных сообщениях бота</div>
-          <div style="font-size:13px;color:#e0f2fe;line-height:1.45;margin-bottom:12px">
-            В реальном Telegram-боте сообщение приходит с защитой от пересылки и двумя кнопками: сначала переход по рекламе, затем кнопка получения награды.
-          </div>
-          <button type="button" id="bot_pv_click" class="btn" style="width:100%;background:#f0c419;color:#0d2f21;font-weight:700;min-height:42px;margin-bottom:8px">
-            1. Перейти по рекламной ссылке
-          </button>
-          <div id="bot_pv_status" style="font-size:12px;color:#fef08a;text-align:center">Сначала выполните переход по кнопке выше</div>
+        ${subtitle ? `<div class="small muted" style="margin-bottom:10px">${e(subtitle)}</div>` : ''}
+        <div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:10px;padding:14px;margin-bottom:12px;font-size:13.5px;line-height:1.5;color:#0c4a6e">
+          <b>Рекламный пост отправлен в личные сообщения Telegram-бота!</b>
+          <ol style="margin:8px 0 0;padding-left:18px">
+            <li>Откройте чат с ботом${botUser ? ` (@${e(botUser)})` : ''}.</li>
+            <li>Нажмите на первую рекламную кнопку в сообщении.</li>
+            <li>Вернитесь к сообщению и нажмите кнопку подтверждения награды.</li>
+          </ol>
         </div>
-        <div class="row" style="gap:8px;justify-content:flex-end">
-          <button type="button" id="bot_pv_cancel" class="btn alt sm" style="min-height:42px">Отмена</button>
-          <button type="button" id="bot_pv_done" class="btn sm" disabled style="min-height:42px;opacity:0.55">Подождите (${remaining}с)</button>
+        <div class="row" style="gap:8px;flex-wrap:wrap;justify-content:flex-end">
+          ${botUrl ? `<a href="${e(botUrl)}" target="_blank" rel="noopener" class="btn sm" style="min-height:42px;display:inline-flex;align-items:center">Открыть чат с ботом</a>` : ''}
+          <button type="button" id="bot_check_now" class="btn alt sm" style="min-height:42px">Проверить статус</button>
+          <button type="button" id="bot_wait_cancel" class="btn alt sm" style="min-height:42px">Закрыть</button>
         </div>
-        <div class="small muted" style="margin-top:8px;font-size:11px">Чтобы отправлять реальные посты в Telegram, укажите Publisher Token, числовой Block ID и подключите Webhook в Админке → Настройки.</div>
       </div>
     `;
 
     modal(html, (el, close) => {
       const closeModal = typeof close === 'function' ? close : () => el.remove();
-      const timerBadge = el.querySelector('#bot_pv_timer') as HTMLElement;
-      const clickBtn = el.querySelector('#bot_pv_click') as HTMLButtonElement;
-      const statusEl = el.querySelector('#bot_pv_status') as HTMLElement;
-      const doneBtn = el.querySelector('#bot_pv_done') as HTMLButtonElement;
-      const cancelBtn = el.querySelector('#bot_pv_cancel') as HTMLButtonElement;
+      const badge = el.querySelector('#bot_wait_badge') as HTMLElement | null;
+      const checkBtn = el.querySelector('#bot_check_now') as HTMLButtonElement;
+      const cancelBtn = el.querySelector('#bot_wait_cancel') as HTMLButtonElement;
 
-      const syncState = () => {
-        if (remaining <= 0 && clickedAd) {
-          doneBtn.disabled = false;
-          doneBtn.style.opacity = '1';
-          doneBtn.textContent = '2. Получить награду';
-        } else if (remaining <= 0 && !clickedAd) {
-          doneBtn.disabled = true;
-          doneBtn.style.opacity = '0.55';
-          doneBtn.textContent = 'Нажмите кнопку перехода выше';
-        } else {
-          doneBtn.disabled = true;
-          doneBtn.style.opacity = '0.55';
-          doneBtn.textContent = `Подождите (${remaining}с)`;
-        }
-      };
-
-      clickBtn.onclick = () => {
-        clickedAd = true;
-        clickBtn.textContent = '1. Переход выполнен ✓';
-        clickBtn.style.background = '#bbf7d0';
-        statusEl.textContent = 'Кнопка награды активирована ✓';
-        statusEl.style.color = '#86efac';
-        syncState();
-      };
-
-      timerId = setInterval(() => {
-        remaining = Math.max(0, remaining - 1);
-        if (timerBadge) timerBadge.textContent = remaining > 0 ? `${remaining} сек` : 'Готово';
-        syncState();
-        if (remaining <= 0) {
-          clearInterval(timerId);
-          timerId = null;
-        }
-      }, 1000);
-
-      cancelBtn.onclick = () => {
-        closeModal();
-        finishResolve(null);
-      };
-
-      doneBtn.onclick = async () => {
-        doneBtn.disabled = true;
-        doneBtn.textContent = 'Проверка…';
+      const checkStatus = async (manual = false) => {
         try {
-          const completed = await api('/ads/bot/complete', { sessionToken, clicked: clickedAd });
-          closeModal();
-          if (completed?.alreadyCredited) {
-            finishResolve({ blockKey, clicked: true, alreadyCredited: true, creditResult: completed.creditResult });
-          } else {
-            finishResolve({ adProof: completed.adProof, blockKey, clicked: true });
+          const st = await api(`/ads/bot/status?sessionToken=${encodeURIComponent(sessionToken)}`);
+          if (st?.consumed && st?.creditResult) {
+            closeModal();
+            finish({ blockKey, clicked: true, alreadyCredited: true, creditResult: st.creditResult });
+            return true;
           }
-        } catch (err: any) {
-          toast(err?.message || 'Ошибка подтверждения бот-рекламы', true);
-          doneBtn.disabled = false;
-          syncState();
-        }
+          if (st?.expired) {
+            if (badge) badge.textContent = 'Истекло';
+            toast('Срок ожидания рекламного сообщения истёк.', true);
+            closeModal();
+            finish(null);
+            return true;
+          }
+          if (manual) {
+            toast('Переход и подтверждение награды в боте ещё не зафиксированы.', true);
+          }
+        } catch {}
+        return false;
       };
+
+      pollId = setInterval(() => { checkStatus(false); }, 2500);
+      checkBtn.onclick = () => { checkStatus(true); };
+      cancelBtn.onclick = () => { closeModal(); finish(null); };
 
       observer = new MutationObserver(() => {
-        if (!document.body.contains(el)) finishResolve(null);
+        if (!document.body.contains(el)) finish(null);
       });
       observer.observe(document.body, { childList: true, subtree: true });
     });
@@ -2906,21 +2732,47 @@ export function renderAdminAdsSettingsHtml(ov: any, e: (s: any) => string): stri
   if (!defs.length) return '';
   const baseUrl = String(ov.settings?.appBaseUrl || ov.settings?.siteUrl || (typeof location !== 'undefined' ? location.origin : '')).replace(/\/+$/, '');
   const rewardUrl = baseUrl ? `${baseUrl}/api/ads/bot-reward` : '/api/ads/bot-reward';
+  const sdkRewardUrl = baseUrl ? `${baseUrl}/api/ads/sdk-reward?userid=[userId]` : '/api/ads/sdk-reward?userid=[userId]';
   const webhookUrl = baseUrl ? `${baseUrl}/api/telegram/bot-webhook` : '/api/telegram/bot-webhook';
+  const isBlockOk = (d: any, val: string) => {
+    const v = String(val || '').trim();
+    if (!v || v === d.defaultBlockId) return false;
+    if (d.format === 'bot') return /^\d+$/.test(v.replace(/^bot-/i, '').trim());
+    return isRealConfiguredSdkBlockId(v);
+  };
 
   return `
     <div class="panel" style="margin-top:16px">
       <h3>Рекламная сеть Adsgram (отдельный Block ID для каждой кнопки)</h3>
-      <p class="small muted" style="margin:0 0 10px">Укажите реальные Block ID из личного кабинета Adsgram для каждой кнопки. Для блоков Telegram-бота используйте числовой ID (или <code>bot-12345</code>). В предпросмотре при строковых ID работает интерактивная эмуляция.</p>
+      <p class="small muted" style="margin:0 0 10px">Укажите реальные Block ID из личного кабинета Adsgram (числовой ID, <code>int-12345</code> или <code>task-12345</code>; для бота — числовой ID или <code>bot-12345</code>). Блоки со строковыми заглушками отключены и не засчитываются как просмотр.</p>
       <div class="grid g2">
-        ${defs.map((d: any) => `
-          <label class="small" style="display:block">${e(d.label)}
-            <input id="ads_blk_${e(d.key)}" value="${e(blocks[d.key] || d.defaultBlockId)}" style="width:100%;margin-top:4px;font-family:monospace">
-          </label>
-        `).join('')}
+        ${defs.map((d: any) => {
+          const curVal = String(blocks[d.key] || d.defaultBlockId);
+          const ok = isBlockOk(d, curVal);
+          return `
+          <label class="small" style="display:block">
+            <span style="display:flex;justify-content:space-between;gap:6px;align-items:center">
+              <span>${e(d.label)}</span>
+              <span style="font-size:11px;font-weight:700;color:${ok ? '#15803d' : '#b91c1c'}">${ok ? '✓ Подключён' : '✕ Заглушка'}</span>
+            </span>
+            <input id="ads_blk_${e(d.key)}" value="${e(curVal)}" style="width:100%;margin-top:4px;font-family:monospace">
+          </label>`;
+        }).join('')}
       </div>
 
       <div style="margin-top:14px;padding:12px 14px;background:var(--soft);border:1px solid var(--line);border-radius:10px">
+        <div style="font-weight:700;font-size:13.5px;margin-bottom:6px">Серверная проверка Mini App SDK (S2S Reward URL)</div>
+        <div class="small muted" style="line-height:1.5;margin-bottom:8px">
+          <b>SDK Reward URL</b> (необязательно, для максимальной защиты вставьте в поле Reward URL в блоке Adsgram):<br>
+          <code style="user-select:all;word-break:break-all">${e(sdkRewardUrl)}</code>
+        </div>
+        <label class="small" style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input type="checkbox" id="ads_require_s2s" ${ov.settings?.requireAdsgramS2S ? 'checked' : ''} style="width:auto">
+          <span>Требовать строгое S2S-подтверждение от сервера Adsgram (Reward URL) для мини-приложения</span>
+        </label>
+      </div>
+
+      <div style="margin-top:12px;padding:12px 14px;background:var(--soft);border:1px solid var(--line);border-radius:10px">
         <div style="font-weight:700;font-size:13.5px;margin-bottom:6px">Настройка рекламы в сообщениях Telegram-бота (Adsgram Bot)</div>
         <label class="small" style="display:block;margin-bottom:8px">Publisher Token из профиля Adsgram
           <input id="ads_bot_token" value="${e(ov.settings?.adsgramBotToken || '')}" placeholder="Скопируйте токен издателя из кабинета Adsgram" style="width:100%;margin-top:4px;font-family:monospace">
@@ -2958,6 +2810,11 @@ export function collectAdminAdsBotToken(): string {
   return inp ? inp.value.trim() : '';
 }
 
+export function collectAdminAdsRequireS2S(): boolean {
+  const inp = document.getElementById('ads_require_s2s') as HTMLInputElement | null;
+  return !!inp?.checked;
+}
+
 window.__RPL_EXT__ = {
   getClientHeaders,
   syncTelegramAuth,
@@ -2969,4 +2826,5 @@ window.__RPL_EXT__ = {
   renderAdminAdsSettingsHtml,
   collectAdminAdsBlocks,
   collectAdminAdsBotToken,
+  collectAdminAdsRequireS2S,
 };

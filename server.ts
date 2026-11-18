@@ -16942,7 +16942,8 @@ app.get("/api/admin/overview", admin, (req, res) => {
       adminCode: process.env.ADMIN_CODE || HARDCODED.adminCode || db.settings.adminCode,
       systemPrompt: db.settings.systemPrompt || SYS_DEFAULT,
       adsgramBlocks: getAdsgramBlocks(db),
-      adsgramBlockDefs: ADSGRAM_BLOCKS
+      adsgramBlockDefs: ADSGRAM_BLOCKS,
+      requireAdsgramS2S: !!db.settings.requireAdsgramS2S
     },
     telegramStatus: tgLastStatus,
     keys: {
@@ -17022,6 +17023,9 @@ app.post("/api/admin/settings", admin, (req, res) => {
         if (val) s.adsgramBlocks[def.key] = val;
       }
     }
+  }
+  if (b.requireAdsgramS2S !== undefined) {
+    s.requireAdsgramS2S = !!b.requireAdsgramS2S;
   }
   if (typeof b.systemPrompt === "string") s.systemPrompt = b.systemPrompt.trim() === SYS_DEFAULT.trim() ? "" : b.systemPrompt;
   const KEYF = { gemini: ["geminiKeys", "geminiKey"], groq: ["groqKeys", "groqKey"], openrouter: ["openrouterKeys", "openrouterKey"] };
