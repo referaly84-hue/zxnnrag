@@ -2656,6 +2656,7 @@ function renderPredictionsContent(app: HTMLElement, data: any) {
       }
       cpSubmit.disabled = true;
       cpSubmit.textContent = '⏳ Оформляем ставку…';
+      let timeoutId: ReturnType<typeof setTimeout> | null = null;
       try {
         const res = await Promise.race([
           api('/predictions/bet-batch', {
@@ -2668,10 +2669,14 @@ function renderPredictionsContent(app: HTMLElement, data: any) {
               exactAway: it.exactAway,
             })),
           }),
-          new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error('Сервер не ответил вовремя. Попробуйте ещё раз.')), 12000)
-          ),
+          new Promise<never>((_, reject) => {
+            timeoutId = setTimeout(
+              () => reject(new Error('Сервер не ответил за 2 секунды. Попробуйте ещё раз.')),
+              2000
+            );
+          }),
         ]);
+        if (timeoutId) clearTimeout(timeoutId);
         toast(res.message);
         COUPON_ITEMS = [];
         if (typeof res.coins === 'number') data.wallet.coins = res.coins;
@@ -2680,6 +2685,7 @@ function renderPredictionsContent(app: HTMLElement, data: any) {
         }
         renderPredictionsContent(app, data);
       } catch (err: any) {
+        if (timeoutId) clearTimeout(timeoutId);
         const msg = err?.message || 'Ошибка оформления купона';
         toast(msg, true);
         if (statusEl) {
