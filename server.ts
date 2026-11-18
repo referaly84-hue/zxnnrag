@@ -4882,7 +4882,6 @@ var HARDCODED = {
   get openrouterModel() { return String(readSecretsFile().openrouterModel || process.env.OPENROUTER_MODEL || "openrouter/free").trim(); },
   get tgToken() { const t = String(readSecretsFile().tgToken || "").trim(); return t.includes("\u2022") ? "" : t; },
   get tgChat() { return String(readSecretsFile().tgChat || "").trim(); },
-  get adsgramBotToken() { const t = String(readSecretsFile().adsgramBotToken || "").trim(); return t.includes("\u2022") ? "" : t; },
   get adminCode() { return readSecretsFile().adminCode || ""; },
   get workerUrl() { return String(readSecretsFile().workerUrl || process.env.GEMINI_PROXY_URL || "").trim(); },
   get workerSecret() { return String(readSecretsFile().workerSecret || process.env.GEMINI_PROXY_SECRET || "").trim(); }
@@ -4893,8 +4892,7 @@ var HARDCODED_LEGACY = {
   groqKey: "",
   openrouterKey: "",
   tgToken: "",
-  tgChat: "",
-  adsgramBotToken: ""
+  tgChat: ""
 };
 var tgToken = () => {
   syncSecretsFromDisk();
@@ -4903,10 +4901,6 @@ var tgToken = () => {
 var tgChat = () => {
   syncSecretsFromDisk();
   return normalizeTgChat(HARDCODED.tgChat || process.env.TELEGRAM_CHAT_ID || process.env.TG_CHAT || "");
-};
-var adsgramBotToken = () => {
-  syncSecretsFromDisk();
-  return String(HARDCODED.adsgramBotToken || process.env.ADSGRAM_BOT_TOKEN || "").trim();
 };
 var __filename = fileURLToPath(import.meta.url);
 var __dirname = path3.dirname(__filename);
@@ -16936,8 +16930,6 @@ app.get("/api/admin/overview", admin, (req, res) => {
       tgToken: tgToken() ? "\u2022\u2022\u2022\u2022" : "",
       hasTgToken: !!tgToken(),
       tgChat: tgChat(),
-      adsgramBotToken: adsgramBotToken() ? "\u2022\u2022\u2022\u2022" : "",
-      hasAdsgramBotToken: !!adsgramBotToken(),
       appBaseUrl: String(db.settings.siteUrl || process.env.APP_URL || "").trim().replace(/\/+$/, ""),
       adminCode: process.env.ADMIN_CODE || HARDCODED.adminCode || db.settings.adminCode,
       systemPrompt: db.settings.systemPrompt || SYS_DEFAULT,
@@ -17012,9 +17004,6 @@ app.post("/api/admin/settings", admin, (req, res) => {
   if (b.auto !== void 0) s.auto = !!b.auto;
   if (b.techDefeat !== void 0) s.techDefeat = !!b.techDefeat;
   if (b.grounding !== void 0) s.grounding = !!b.grounding;
-  if (typeof b.adsgramBotToken === "string" && !b.adsgramBotToken.includes("\u2022")) {
-    secUpdates.adsgramBotToken = b.adsgramBotToken.trim();
-  }
   if (b.adsgramBlocks && typeof b.adsgramBlocks === "object") {
     s.adsgramBlocks ||= {};
     for (const def of ADSGRAM_BLOCKS) {
@@ -21202,7 +21191,6 @@ function getAdsCtx(): AdServerContext {
     ensureInitialBudgets,
     compName: (id: string) => db.comps?.find((c: any) => c.id === id)?.name || id,
     getTgBotToken: tgToken,
-    getAdsgramBotToken: adsgramBotToken,
     getSiteUrl: () => String(db.settings.siteUrl || process.env.APP_URL || "").trim().replace(/\/+$/, "")
   };
 }
