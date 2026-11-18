@@ -596,6 +596,9 @@ function ensureExtStyles() {
       gap:10px;
       flex-wrap:wrap;
     }
+    .toast{
+      z-index:2500 !important;
+    }
     .pred-slip-cta{
       background:#f0c419;
       color:#0d2f21;
@@ -608,8 +611,12 @@ function ensureExtStyles() {
       cursor:pointer;
       white-space:nowrap;
     }
-    .pred-slip-cta:hover{
+    .pred-slip-cta:hover:not(:disabled){
       background:#ffd43b;
+    }
+    .pred-slip-cta:disabled{
+      opacity:0.65;
+      cursor:not-allowed;
     }
     .pred-active-bets{
       border-top:1px solid #e5eee8;
@@ -1601,13 +1608,15 @@ export function renderClubSponsorsTab(cb: HTMLElement, c: any, reloadClub: () =>
 
 // ─── Predictions Page (#/predictions) ─────────────────────────────────────────
 let PRED_SUBTAB: 'matches' | 'leagues' | 'history' = 'matches';
-let SELECTED_LEAGUE_ID = 'global';
 let SELECTED_STAKE = 1;
 let PRED_COMP_FILTER = 'all';
 let PRED_SEARCH = '';
 let COUPON_EXPANDED = true;
 const OPEN_MARKETS_FIXTURES = new Set<string>();
 const FIXTURE_ACTIVE_GROUP = new Map<string, string>();
+let CACHED_PRED_DATA: any = null;
+let CACHED_PRED_AT = 0;
+let PRED_FETCH_SEQ = 0;
 
 interface CouponItem {
   key: string;
@@ -1629,17 +1638,51 @@ function fmtCoins(n: any): string {
   return Number.isInteger(num) ? String(num) : num.toFixed(2).replace(/\.?0+$/, '');
 }
 
-export async function renderPredictionsPage(app: HTMLElement) {
+function isFixtureBetLocked(f: any, nowMs = Date.now()): boolean {
+  const closeAt = Number(f?.betCloseAt || 0);
+  return closeAt > 0 && nowMs >= closeAt;
+}
+
+export async function renderPredictionsPage(app: HTMLElement, opts?: { forceReload?: boolean; silent?: boolean }) {
   ensureExtStyles();
-  const { api, e, toast } = B();
-  app.innerHTML = '<div class="panel">Загрузка линии прогнозов…</div>';
-  let data: any;
-  try {
-    data = await api('/predictions');
-  } catch (err: any) {
-    app.innerHTML = `<div class="panel warn">${e(err?.message || 'Ошибка загрузки прогнозов')}</div>`;
+  const { api, e } = B();
+  const seq = ++PRED_FETCH_SEQ;
+
+  if (CACHED_PRED_DATA && !opts?.forceReload) {
+    renderPredictionsContent(app, CACHED_PRED_DATA);
+    if (Date.now() - CACHED_PRED_AT > 15_000) {
+      api('/predictions').then((fresh) => {
+        if (seq !== PRED_FETCH_SEQ || !document.body.contains(app)) return;
+        CACHED_PRED_DATA = fresh;
+        CACHED_PRED_AT = Date.now();
+        if (PRED_SUBTAB !== 'matches' || !COUPON_ITEMS.length) {
+          renderPredictionsContent(app, fresh);
+        }
+      }).catch(() => {});
+    }
     return;
   }
+
+  if (!CACHED_PRED_DATA && !opts?.silent) {
+    app.innerHTML = '<div class="panel">Загрузка линии прогнозов…</div>';
+  }
+  try {
+    const fresh = await api('/predictions');
+    if (seq !== PRED_FETCH_SEQ) return;
+    CACHED_PRED_DATA = fresh;
+    CACHED_PRED_AT = Date.now();
+    renderPredictionsContent(app, fresh);
+  } catch (err: any) {
+    if (seq !== PRED_FETCH_SEQ) return;
+    if (!CACHED_PRED_DATA) {
+      app.innerHTML = `<div class="panel warn">${e(err?.message || 'Ошибка загрузки прогнозов')}</div>`;
+    }
+  }
+}
+
+function renderPredictionsContent(app: HTMLElement, data: any) {
+  ensureExtStyles();
+  const { api, e, toast } = B();
 
   const wallet = data.wallet;
   const prof = data.profile || {};
@@ -1660,8 +1703,11 @@ export async function renderPredictionsPage(app: HTMLElement) {
     placedByKey.set(key, p);
   }
 
-  // Prune coupon items for fixtures no longer open or already placed
-  const openFixSet = new Set<string>((data.fixtures || []).map((f: any) => f.id));
+  // Prune coupon items for fixtures no longer open, locked (<=2 min to kickoff), or already placed
+  const nowRender = Date.now();
+  const openFixSet = new Set<string>(
+    (data.fixtures || []).filter((f: any) => !isFixtureBetLocked(f, nowRender)).map((f: any) => f.id)
+  );
   COUPON_ITEMS = COUPON_ITEMS.filter((it) => openFixSet.has(it.fixtureId) && !placedByKey.has(it.key));
 
   const couponKeySet = new Set<string>(COUPON_ITEMS.map((it) => it.key));
@@ -1674,15 +1720,22 @@ export async function renderPredictionsPage(app: HTMLElement) {
     shortLbl: string,
     odd: number,
     pick: string,
-    fullLabel: string
+    fullLabel: string,
+    isBetClosed = false
   ) => {
     const itemKey = `${fid}|${marketId}|${pick}`;
     const placed = placedByKey.get(itemKey);
     const inCoupon = couponKeySet.has(itemKey);
+    const isDisabled = !!placed || isBetClosed;
+    const titleAttr = placed
+      ? 'title="Ставка уже принята"'
+      : isBetClosed
+        ? 'title="Приём ставок завершается за 2 минуты до матча"'
+        : '';
     return `
       <button type="button"
         class="pred-odd-btn ${placed ? 'betted' : inCoupon ? 'on' : ''}"
-        ${placed ? 'disabled title="Ставка уже принята"' : ''}
+        ${isDisabled ? `disabled ${titleAttr}` : ''}
         data-sel-bet="${e(fid)}"
         data-match-label="${e(matchLabel)}"
         data-market="${e(marketId)}"
@@ -1695,7 +1748,7 @@ export async function renderPredictionsPage(app: HTMLElement) {
       </button>`;
   };
 
-  const renderMarketBlock = (f: any, m: any, matchLabel: string) => {
+  const renderMarketBlock = (f: any, m: any, matchLabel: string, isBetClosed = false) => {
     if (!m || !Array.isArray(m.options) || !m.options.length) return '';
     const colsClass = m.options.length === 2
       ? 'pred-line-2'
@@ -1710,7 +1763,7 @@ export async function renderPredictionsPage(app: HTMLElement) {
         </div>
         <div class="${colsClass}">
           ${m.options.map((o: any) =>
-            renderOddBtn(f.id, matchLabel, m.id, m.title, o.shortLabel, o.odd, o.pick, o.label)
+            renderOddBtn(f.id, matchLabel, m.id, m.title, o.shortLabel, o.odd, o.pick, o.label, isBetClosed)
           ).join('')}
         </div>
       </div>`;
@@ -1791,12 +1844,21 @@ export async function renderPredictionsPage(app: HTMLElement) {
           const customH = Math.max(0, Math.min(15, Number((document.getElementById(`es_h_${f.id}`) as HTMLInputElement)?.value ?? 1)));
           const customA = Math.max(0, Math.min(15, Number((document.getElementById(`es_a_${f.id}`) as HTMLInputElement)?.value ?? 1)));
           const customOdd = f.exactMatrix?.[customH]?.[customA] ?? Math.min(3.0, Math.round((1.5 + Math.min(1.5, Math.max(0, customH + customA - 4) * 0.18)) * 100) / 100);
+          const betCloseAt = Number(f.betCloseAt || 0);
+          const nowFx = Date.now();
+          const isBetClosed = betCloseAt > 0 && nowFx >= betCloseAt;
+          const remCloseMs = betCloseAt > nowFx ? betCloseAt - nowFx : 0;
+          const closeBadgeHtml = isBetClosed
+            ? '<span style="color:#b91c1c;font-weight:700">Приём закрыт (за 2 мин)</span>'
+            : (remCloseMs > 0 && remCloseMs <= 60 * 60 * 1000)
+              ? `<span style="color:#b45309;font-weight:600" data-fx-lock="${betCloseAt}">⏳ Приём ещё ${fmtShortCooldown(remCloseMs)}</span>`
+              : `<span>${e(f.date)} · ${e(f.time)}</span>`;
 
           return `
-          <div class="pred-card" data-fx-card="${e(f.id)}">
+          <div class="pred-card" data-fx-card="${e(f.id)}" style="${isBetClosed ? 'opacity:0.72' : ''}">
             <div class="pred-card-head">
               <span><b>${e(f.compName)}</b> · ${e(f.label)}</span>
-              <span>${e(f.date)} · ${e(f.time)}</span>
+              ${closeBadgeHtml}
             </div>
 
             <div class="pred-teams">
@@ -1828,7 +1890,7 @@ export async function renderPredictionsPage(app: HTMLElement) {
                 <div class="pred-sec-lbl"><span>Основной исход (1 Х 2)</span></div>
                 <div class="pred-line-3">
                   ${mOutcome.options.map((o: any) =>
-                    renderOddBtn(f.id, matchLabel, 'outcome', 'Исход матча', o.shortLabel, o.odd, o.pick, o.label)
+                    renderOddBtn(f.id, matchLabel, 'outcome', 'Исход матча', o.shortLabel, o.odd, o.pick, o.label, isBetClosed)
                   ).join('')}
                 </div>
               </div>` : ''}
@@ -1838,7 +1900,7 @@ export async function renderPredictionsPage(app: HTMLElement) {
                 <div class="pred-sec-lbl"><span>Двойной шанс</span></div>
                 <div class="pred-line-3">
                   ${mDouble.options.map((o: any) =>
-                    renderOddBtn(f.id, matchLabel, 'double_chance', 'Двойной шанс', o.shortLabel, o.odd, o.pick, o.label)
+                    renderOddBtn(f.id, matchLabel, 'double_chance', 'Двойной шанс', o.shortLabel, o.odd, o.pick, o.label, isBetClosed)
                   ).join('')}
                 </div>
               </div>` : ''}
@@ -1849,7 +1911,7 @@ export async function renderPredictionsPage(app: HTMLElement) {
                   <div class="pred-sec-lbl"><span>Тотал 2.5</span></div>
                   <div class="pred-line-2">
                     ${mTotal25.options.map((o: any) =>
-                      renderOddBtn(f.id, matchLabel, 'total_goals', 'Тотал 2.5', o.shortLabel, o.odd, o.pick, o.label)
+                      renderOddBtn(f.id, matchLabel, 'total_goals', 'Тотал 2.5', o.shortLabel, o.odd, o.pick, o.label, isBetClosed)
                     ).join('')}
                   </div>
                 </div>` : ''}
@@ -1858,7 +1920,7 @@ export async function renderPredictionsPage(app: HTMLElement) {
                   <div class="pred-sec-lbl"><span>Обе забьют</span></div>
                   <div class="pred-line-2">
                     ${mBtts.options.map((o: any) =>
-                      renderOddBtn(f.id, matchLabel, 'btts', 'Обе забьют', o.shortLabel === 'ОЗ Да' ? 'Да' : 'Нет', o.odd, o.pick, o.label)
+                      renderOddBtn(f.id, matchLabel, 'btts', 'Обе забьют', o.shortLabel === 'ОЗ Да' ? 'Да' : 'Нет', o.odd, o.pick, o.label, isBetClosed)
                     ).join('')}
                   </div>
                 </div>` : ''}
@@ -1869,7 +1931,7 @@ export async function renderPredictionsPage(app: HTMLElement) {
                 <div class="pred-sec-lbl"><span>Фора (0) · возврат при ничьей</span></div>
                 <div class="pred-line-2">
                   ${mHcp0.options.map((o: any) =>
-                    renderOddBtn(f.id, matchLabel, 'hcp_0', 'Фора (0)', o.shortLabel, o.odd, o.pick, o.label)
+                    renderOddBtn(f.id, matchLabel, 'hcp_0', 'Фора (0)', o.shortLabel, o.odd, o.pick, o.label, isBetClosed)
                   ).join('')}
                 </div>
               </div>` : ''}
@@ -1888,7 +1950,7 @@ export async function renderPredictionsPage(app: HTMLElement) {
                 </div>
 
                 ${activeGroup !== 'exact'
-                  ? groupMarkets.map((m) => renderMarketBlock(f, m, matchLabel)).join('')
+                  ? groupMarkets.map((m) => renderMarketBlock(f, m, matchLabel, isBetClosed)).join('')
                   : `<div>
                       <div class="pred-sec-lbl">
                         <span>Популярные счета</span>
@@ -1902,7 +1964,7 @@ export async function renderPredictionsPage(app: HTMLElement) {
                           return `
                             <button type="button"
                               class="pred-odd-btn ${placed ? 'betted' : inCoupon ? 'on' : ''}"
-                              ${placed ? 'disabled' : ''}
+                              ${(placed || isBetClosed) ? 'disabled' : ''}
                               data-es-pick="${e(f.id)}"
                               data-match-label="${e(matchLabel)}"
                               data-eh="${qs.h}"
@@ -1915,10 +1977,10 @@ export async function renderPredictionsPage(app: HTMLElement) {
                       </div>
                       <div class="pred-es-custom">
                         <span class="small muted">Свой счёт:</span>
-                        <input id="es_h_${e(f.id)}" class="pred-inline-input" type="number" min="0" max="15" value="${customH}" data-es-inp="${e(f.id)}">
+                        <input id="es_h_${e(f.id)}" class="pred-inline-input" type="number" min="0" max="15" value="${customH}" data-es-inp="${e(f.id)}" ${isBetClosed ? 'disabled' : ''}>
                         <b>:</b>
-                        <input id="es_a_${e(f.id)}" class="pred-inline-input" type="number" min="0" max="15" value="${customA}" data-es-inp="${e(f.id)}">
-                        <button type="button" class="btn alt sm" data-es-custom="${e(f.id)}" data-match-label="${e(matchLabel)}" style="min-height:36px">
+                        <input id="es_a_${e(f.id)}" class="pred-inline-input" type="number" min="0" max="15" value="${customA}" data-es-inp="${e(f.id)}" ${isBetClosed ? 'disabled' : ''}>
+                        <button type="button" class="btn alt sm" data-es-custom="${e(f.id)}" data-match-label="${e(matchLabel)}" style="min-height:36px" ${isBetClosed ? 'disabled' : ''}>
                           В купон (<span id="es_odd_lbl_${e(f.id)}">×${Number(customOdd).toFixed(2)}</span>)
                         </button>
                       </div>
@@ -1942,46 +2004,61 @@ export async function renderPredictionsPage(app: HTMLElement) {
   };
 
   const renderLeaguesTab = () => {
-    const activeLeague = SELECTED_LEAGUE_ID === 'global'
-      ? null
-      : (data.leagues || []).find((l: any) => l.id === SELECTED_LEAGUE_ID);
-    const board = activeLeague ? activeLeague.leaderboard : data.leaderboard;
+    const baseBoard: any[] = Array.isArray(data.leaderboard) ? data.leaderboard : [];
 
-    return `
-      <div class="grid g2" style="margin-bottom:14px">
-        <div class="panel" style="margin-bottom:0">
-          <h3 style="margin:0 0 8px">Создать свою лигу пользователей</h3>
-          <div class="row" style="gap:8px;flex-wrap:wrap">
-            <input id="lg_name" placeholder="Название лиги (например: Друзья Спартака)" style="flex:1;min-width:190px">
-            <button class="btn sm" id="lg_create_btn" style="min-height:42px">Создать лигу</button>
-          </div>
-          <input id="lg_desc" placeholder="Описание лиги (необязательно)" style="width:100%;margin-top:8px">
-        </div>
-        <div class="panel" style="margin-bottom:0">
-          <h3 style="margin:0 0 8px">Вступить в лигу по коду</h3>
-          <div class="row" style="gap:8px;flex-wrap:wrap">
-            <input id="lg_join_code" placeholder="Код приглашения (например: A1B2C3)" style="flex:1;min-width:170px">
-            <button class="btn alt sm" id="lg_join_btn" style="min-height:42px">Вступить</button>
-          </div>
-          <div class="small muted" style="margin-top:8px">Выберите лигу ниже для просмотра её таблицы:</div>
-          <div class="row" style="gap:6px;flex-wrap:wrap;margin-top:6px">
-            <button class="btn sm ${SELECTED_LEAGUE_ID === 'global' ? '' : 'alt'}" data-sel-lg="global">Общая лига (${data.leaderboard.length})</button>
-            ${(data.leagues || []).map((lg: any) => `
-              <button class="btn sm ${SELECTED_LEAGUE_ID === lg.id ? '' : 'alt'}" data-sel-lg="${e(lg.id)}">${e(lg.name)} (${lg.membersCount})</button>
-            `).join('')}
-          </div>
-        </div>
-      </div>
+    const byCorrect = [...baseBoard].sort(
+      (a, b) =>
+        b.correct - a.correct ||
+        b.points - a.points ||
+        b.kpd - a.kpd ||
+        a.wrong - b.wrong ||
+        String(a.displayName || '').localeCompare(String(b.displayName || ''), 'ru')
+    );
 
-      <div class="panel">
-        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px">
-          <div>
-            <h3 style="margin:0">${activeLeague ? e(activeLeague.name) : 'Таблица лидеров Лиги прогнозов'}</h3>
-            <div class="small muted">${activeLeague ? `Код приглашения: <b>${e(activeLeague.code)}</b>${activeLeague.description ? ' · ' + e(activeLeague.description) : ''}` : 'Имя и аватарка автоматически подтягиваются из вашего Telegram.'}</div>
-          </div>
-          ${activeLeague ? (activeLeague.isMember
-            ? `<button class="btn alt sm" id="lg_leave_btn" data-lid="${e(activeLeague.id)}">Выйти из лиги</button>`
-            : `<button class="btn sm" id="lg_join_direct" data-lid="${e(activeLeague.id)}">Вступить в лигу</button>`) : ''}
+    const byWrong = [...baseBoard].sort(
+      (a, b) =>
+        b.wrong - a.wrong ||
+        b.total - a.total ||
+        a.correct - b.correct ||
+        String(a.displayName || '').localeCompare(String(b.displayName || ''), 'ru')
+    );
+
+    const byKpd = [...baseBoard].sort(
+      (a, b) =>
+        b.kpd - a.kpd ||
+        b.correct - a.correct ||
+        b.total - a.total ||
+        b.points - a.points ||
+        String(a.displayName || '').localeCompare(String(b.displayName || ''), 'ru')
+    );
+
+    const byPoints = [...baseBoard].sort(
+      (a, b) =>
+        b.points - a.points ||
+        b.correct - a.correct ||
+        b.kpd - a.kpd ||
+        a.wrong - b.wrong ||
+        String(a.displayName || '').localeCompare(String(b.displayName || ''), 'ru')
+    );
+
+    const renderBoardCard = (
+      title: string,
+      subtitle: string,
+      rows: any[],
+      focusCol: 'correct' | 'wrong' | 'kpd' | 'points'
+    ) => {
+      const colLabel = focusCol === 'correct'
+        ? 'Угадал'
+        : focusCol === 'wrong'
+          ? 'Не угадал'
+          : focusCol === 'kpd'
+            ? 'КПД'
+            : 'Очки';
+      return `
+      <div class="panel" style="margin-bottom:0">
+        <div style="margin-bottom:10px">
+          <h3 style="margin:0 0 3px">${e(title)}</h3>
+          <div class="small muted">${e(subtitle)}</div>
         </div>
         <div class="wrap">
           <table>
@@ -1989,44 +2066,55 @@ export async function renderPredictionsPage(app: HTMLElement) {
               <tr>
                 <th>#</th>
                 <th class="l">Участник</th>
-                <th>Угадал</th>
-                <th>Не угадал</th>
-                <th>КПД</th>
-                <th>Очки</th>
+                <th>${colLabel}</th>
               </tr>
             </thead>
             <tbody style="font-variant-numeric:tabular-nums">
-              ${board.map((r: any) => {
+              ${rows.map((r: any, idx: number) => {
+                const rank = idx + 1;
                 const subBits: string[] = [];
                 if (r.teamName) subBits.push(r.teamName);
                 if (r.telegramUsername) subBits.push(`@${r.telegramUsername}`);
-                const subText = subBits.join(' · ') || 'Участник лиги';
+                const subText = subBits.join(' · ') || 'Участник';
                 const isMe = r.actorKey === data.actorKey;
+                const valHtml = focusCol === 'correct'
+                  ? `<td style="color:#15803d;font-weight:700">${r.correct}</td>`
+                  : focusCol === 'wrong'
+                    ? `<td style="color:#b91c1c;font-weight:700">${r.wrong}</td>`
+                    : focusCol === 'kpd'
+                      ? `<td style="color:#0369a1;font-weight:700">${r.kpd}%</td>`
+                      : `<td style="color:#0d2f21;font-weight:800">${r.points}</td>`;
                 return `
                 <tr style="${isMe ? 'background:#f0fdf4;' : ''}">
-                  <td><b>${r.rank <= 3 ? (r.rank === 1 ? '🥇' : r.rank === 2 ? '🥈' : '🥉') : r.rank}</b></td>
+                  <td><b>${rank <= 3 ? (rank === 1 ? '🥇' : rank === 2 ? '🥈' : '🥉') : rank}</b></td>
                   <td class="l">
-                    <div style="display:flex;align-items:center;gap:9px">
+                    <div style="display:flex;align-items:center;gap:8px">
                       ${r.photoUrl
-                        ? `<img src="${e(r.photoUrl)}" alt="" referrerpolicy="no-referrer" style="width:34px;height:34px;border-radius:50%;object-fit:cover;flex-shrink:0;border:1px solid var(--line)" onerror="this.style.display='none'">`
+                        ? `<img src="${e(r.photoUrl)}" alt="" referrerpolicy="no-referrer" style="width:30px;height:30px;border-radius:50%;object-fit:cover;flex-shrink:0;border:1px solid var(--line)" onerror="this.style.display='none'">`
                         : r.teamLogo
-                          ? `<img src="${e(r.teamLogo)}" alt="" style="width:30px;height:30px;object-fit:contain;flex-shrink:0">`
-                          : `<div style="width:34px;height:34px;border-radius:50%;background:var(--deep);color:#fff;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0">${e((r.displayName || 'У').slice(0, 1).toUpperCase())}</div>`}
+                          ? `<img src="${e(r.teamLogo)}" alt="" style="width:28px;height:28px;object-fit:contain;flex-shrink:0">`
+                          : `<div style="width:30px;height:30px;border-radius:50%;background:var(--deep);color:#fff;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0">${e((r.displayName || 'У').slice(0, 1).toUpperCase())}</div>`}
                       <div>
                         <div style="font-weight:600">${e(r.displayName)}${isMe ? ' (вы)' : ''}${r.cups > 0 ? ` <span title="Кубок победителя Лиги прогнозов" style="margin-left:4px">🏆${r.cups > 1 ? '×' + r.cups : ''}</span>` : ''}</div>
                         <div class="small muted">${e(subText)}</div>
                       </div>
                     </div>
                   </td>
-                  <td style="color:#15803d;font-weight:700">${r.correct}</td>
-                  <td style="color:#b91c1c">${r.wrong}</td>
-                  <td><b>${r.kpd}%</b></td>
-                  <td><b>${r.points}</b></td>
+                  ${valHtml}
                 </tr>`;
-              }).join('') || '<tr><td colspan="6" class="empty">Участников пока нет</td></tr>'}
+              }).join('') || '<tr><td colspan="3" class="empty">Участников пока нет</td></tr>'}
             </tbody>
           </table>
         </div>
+      </div>`;
+    };
+
+    return `
+      <div class="grid g2" style="gap:14px">
+        ${renderBoardCard('Лучшие по угадыванию', 'Больше всего верных прогнозов', byCorrect, 'correct')}
+        ${renderBoardCard('Лучшие по не угадыванию', 'Больше всего неугаданных прогнозов', byWrong, 'wrong')}
+        ${renderBoardCard('Лучшие по КПД', 'Наивысший процент точных ставок', byKpd, 'kpd')}
+        ${renderBoardCard('Лучшие по очкам', 'Максимум набранных очков в сезоне', byPoints, 'points')}
       </div>
     `;
   };
@@ -2123,6 +2211,7 @@ export async function renderPredictionsPage(app: HTMLElement) {
             ${notEnough
               ? `<div style="font-size:12px;color:#fecaca">Не хватает монет: нужно ${fmtCoins(totalStake)}, на балансе ${fmtCoins(wallet.coins)}. Уменьшите ставки или посмотрите рекламу выше.</div>`
               : ''}
+            <div id="pred_cp_status" style="display:none;font-size:12px;color:#fecaca;line-height:1.35"></div>
             <button type="button" class="pred-slip-cta" id="pred_cp_submit" style="width:100%;min-height:42px;font-size:13.5px;${notEnough ? 'opacity:0.55;cursor:not-allowed' : ''}" ${notEnough ? 'disabled' : ''}>
               ${COUPON_ITEMS.length === 1
                 ? `Поставить за ${fmtCoins(totalStake)} мон.`
@@ -2244,7 +2333,8 @@ export async function renderPredictionsPage(app: HTMLElement) {
 
   if ((window as any).__predTimerHandle) clearInterval((window as any).__predTimerHandle);
   const hasPredCd = !!app.querySelector('[data-pred-cd]');
-  if (wallet.resetAt || hasPredCd) {
+  const hasFxLock = !!app.querySelector('[data-fx-lock]');
+  if (wallet.resetAt || hasPredCd || hasFxLock) {
     (window as any).__predTimerHandle = setInterval(() => {
       const el = document.getElementById('pred_reset_timer');
       if (!el) {
@@ -2253,6 +2343,7 @@ export async function renderPredictionsPage(app: HTMLElement) {
       }
       const nowTick = Date.now();
       let needReload = false;
+      let needLockRefresh = false;
       if (wallet.resetAt) {
         const left = wallet.resetAt - nowTick;
         if (left > 0) el.textContent = fmtCountdown(left);
@@ -2270,9 +2361,22 @@ export async function renderPredictionsPage(app: HTMLElement) {
           needReload = true;
         }
       });
+      app.querySelectorAll('[data-fx-lock]').forEach((lockEl) => {
+        const target = Number((lockEl as HTMLElement).dataset.fxLock || 0);
+        const rem = target - nowTick;
+        if (rem > 0) {
+          lockEl.textContent = `⏳ Приём ещё ${fmtShortCooldown(rem)}`;
+        } else {
+          needLockRefresh = true;
+        }
+      });
       if (needReload) {
         clearInterval((window as any).__predTimerHandle);
-        setTimeout(() => renderPredictionsPage(app), 500);
+        setTimeout(() => renderPredictionsPage(app, { forceReload: true, silent: true }), 500);
+      } else if (needLockRefresh) {
+        clearInterval((window as any).__predTimerHandle);
+        toast('Приём ставок на матч завершён за 2 минуты до начала', true);
+        renderPredictionsContent(app, data);
       }
     }, 1000);
   }
@@ -2280,7 +2384,7 @@ export async function renderPredictionsPage(app: HTMLElement) {
   app.querySelectorAll('[data-pred-tab]').forEach((b) => {
     (b as HTMLElement).onclick = () => {
       PRED_SUBTAB = (b as HTMLElement).dataset.predTab as any;
-      renderPredictionsPage(app);
+      renderPredictionsContent(app, data);
     };
   });
 
@@ -2300,13 +2404,13 @@ export async function renderPredictionsPage(app: HTMLElement) {
       if (!adRes) return;
       if ((adRes as any).alreadyCredited && (adRes as any).creditResult) {
         toast((adRes as any).creditResult.message || 'Начислено +2 монеты!');
-        renderPredictionsPage(app);
+        renderPredictionsPage(app, { forceReload: true, silent: true });
         return;
       }
       try {
         const res = await api('/predictions/earn-coins', { blockKey, adProof: adRes.adProof });
         toast(res.message);
-        renderPredictionsPage(app);
+        renderPredictionsPage(app, { forceReload: true, silent: true });
       } catch (err: any) {
         toast(err?.message || 'Ошибка начисления монет', true);
       }
@@ -2317,7 +2421,7 @@ export async function renderPredictionsPage(app: HTMLElement) {
   app.querySelectorAll('[data-pred-comp]').forEach((b) => {
     (b as HTMLButtonElement).onclick = () => {
       PRED_COMP_FILTER = (b as HTMLElement).dataset.predComp || 'all';
-      renderPredictionsPage(app);
+      renderPredictionsContent(app, data);
     };
   });
 
@@ -2326,7 +2430,7 @@ export async function renderPredictionsPage(app: HTMLElement) {
     searchInp.oninput = () => {
       PRED_SEARCH = searchInp.value;
       const pos = searchInp.selectionStart ?? PRED_SEARCH.length;
-      renderPredictionsPage(app);
+      renderPredictionsContent(app, data);
       const nextInp = document.getElementById('pred_search_inp') as HTMLInputElement | null;
       if (nextInp) {
         nextInp.focus();
@@ -2350,6 +2454,12 @@ export async function renderPredictionsPage(app: HTMLElement) {
     (b as HTMLButtonElement).onclick = () => {
       const ds = (b as HTMLElement).dataset;
       const fid = ds.selBet!;
+      const fxObj = (data.fixtures || []).find((x: any) => x.id === fid);
+      if (fxObj && isFixtureBetLocked(fxObj)) {
+        toast('Приём ставок на этот матч закрыт за 2 минуты до начала.', true);
+        renderPredictionsContent(app, data);
+        return;
+      }
       const matchLabel = ds.matchLabel || '';
       const market = ds.market!;
       const marketTitle = ds.marketTitle || '';
@@ -2375,7 +2485,7 @@ export async function renderPredictionsPage(app: HTMLElement) {
         });
         COUPON_EXPANDED = true;
       }
-      renderPredictionsPage(app);
+      renderPredictionsContent(app, data);
     };
   });
 
@@ -2384,6 +2494,12 @@ export async function renderPredictionsPage(app: HTMLElement) {
     (b as HTMLButtonElement).onclick = () => {
       const ds = (b as HTMLElement).dataset;
       const fid = ds.esPick!;
+      const fxObj = (data.fixtures || []).find((x: any) => x.id === fid);
+      if (fxObj && isFixtureBetLocked(fxObj)) {
+        toast('Приём ставок на этот матч закрыт за 2 минуты до начала.', true);
+        renderPredictionsContent(app, data);
+        return;
+      }
       const matchLabel = ds.matchLabel || '';
       const eh = Number(ds.eh);
       const ea = Number(ds.ea);
@@ -2409,7 +2525,7 @@ export async function renderPredictionsPage(app: HTMLElement) {
         });
         COUPON_EXPANDED = true;
       }
-      renderPredictionsPage(app);
+      renderPredictionsContent(app, data);
     };
   });
 
@@ -2432,10 +2548,15 @@ export async function renderPredictionsPage(app: HTMLElement) {
     (b as HTMLButtonElement).onclick = () => {
       const ds = (b as HTMLElement).dataset;
       const fid = ds.esCustom!;
+      const fxObj = (data.fixtures || []).find((x: any) => x.id === fid);
+      if (fxObj && isFixtureBetLocked(fxObj)) {
+        toast('Приём ставок на этот матч закрыт за 2 минуты до начала.', true);
+        renderPredictionsContent(app, data);
+        return;
+      }
       const matchLabel = ds.matchLabel || '';
       const eh = Math.max(0, Math.min(15, Math.round(Number((document.getElementById(`es_h_${fid}`) as HTMLInputElement)?.value || 0))));
       const ea = Math.max(0, Math.min(15, Math.round(Number((document.getElementById(`es_a_${fid}`) as HTMLInputElement)?.value || 0))));
-      const fxObj = (data.fixtures || []).find((x: any) => x.id === fid);
       const matOdd = fxObj?.exactMatrix?.[eh]?.[ea];
       const estOdd = matOdd || Math.min(3.0, Math.round((1.5 + Math.min(1.5, Math.max(0, eh + ea - 4) * 0.18)) * 100) / 100);
       const key = `${fid}|exact_score|${eh}:${ea}`;
@@ -2459,7 +2580,7 @@ export async function renderPredictionsPage(app: HTMLElement) {
         });
         COUPON_EXPANDED = true;
       }
-      renderPredictionsPage(app);
+      renderPredictionsContent(app, data);
     };
   });
 
@@ -2468,28 +2589,28 @@ export async function renderPredictionsPage(app: HTMLElement) {
   if (cpToggle) {
     cpToggle.onclick = () => {
       COUPON_EXPANDED = !COUPON_EXPANDED;
-      renderPredictionsPage(app);
+      renderPredictionsContent(app, data);
     };
   }
   const cpClear = document.getElementById('pred_cp_clear');
   if (cpClear) {
     cpClear.onclick = () => {
       COUPON_ITEMS = [];
-      renderPredictionsPage(app);
+      renderPredictionsContent(app, data);
     };
   }
   app.querySelectorAll('[data-cp-all]').forEach((b) => {
     (b as HTMLButtonElement).onclick = () => {
       const v = Math.max(1, Math.min(500, Number((b as HTMLElement).dataset.cpAll || 1)));
       COUPON_ITEMS.forEach((it) => { it.stake = v; });
-      renderPredictionsPage(app);
+      renderPredictionsContent(app, data);
     };
   });
   app.querySelectorAll('[data-cp-del]').forEach((b) => {
     (b as HTMLButtonElement).onclick = () => {
       const idx = Number((b as HTMLElement).dataset.cpDel);
       COUPON_ITEMS.splice(idx, 1);
-      renderPredictionsPage(app);
+      renderPredictionsContent(app, data);
     };
   });
   app.querySelectorAll('[data-cp-step]').forEach((b) => {
@@ -2498,7 +2619,7 @@ export async function renderPredictionsPage(app: HTMLElement) {
       const delta = Number((b as HTMLElement).dataset.delta || 0);
       if (COUPON_ITEMS[idx]) {
         COUPON_ITEMS[idx].stake = Math.max(1, Math.min(500, COUPON_ITEMS[idx].stake + delta));
-        renderPredictionsPage(app);
+        renderPredictionsContent(app, data);
       }
     };
   });
@@ -2508,7 +2629,7 @@ export async function renderPredictionsPage(app: HTMLElement) {
       const val = Number((b as HTMLElement).dataset.val || 1);
       if (COUPON_ITEMS[idx]) {
         COUPON_ITEMS[idx].stake = Math.max(1, Math.min(500, val));
-        renderPredictionsPage(app);
+        renderPredictionsContent(app, data);
       }
     };
   });
@@ -2518,7 +2639,7 @@ export async function renderPredictionsPage(app: HTMLElement) {
       const val = Math.max(1, Math.min(500, Math.round(Number((inp as HTMLInputElement).value || 1))));
       if (COUPON_ITEMS[idx]) {
         COUPON_ITEMS[idx].stake = val;
-        renderPredictionsPage(app);
+        renderPredictionsContent(app, data);
       }
     };
   });
@@ -2526,25 +2647,47 @@ export async function renderPredictionsPage(app: HTMLElement) {
   const cpSubmit = document.getElementById('pred_cp_submit') as HTMLButtonElement | null;
   if (cpSubmit) {
     cpSubmit.onclick = async () => {
-      if (!COUPON_ITEMS.length) return;
+      if (!COUPON_ITEMS.length || cpSubmit.disabled) return;
+      const origLabel = cpSubmit.textContent || '';
+      const statusEl = document.getElementById('pred_cp_status');
+      if (statusEl) {
+        statusEl.style.display = 'none';
+        statusEl.textContent = '';
+      }
       cpSubmit.disabled = true;
+      cpSubmit.textContent = '⏳ Оформляем ставку…';
       try {
-        const res = await api('/predictions/bet-batch', {
-          bets: COUPON_ITEMS.map((it) => ({
-            fixtureId: it.fixtureId,
-            market: it.market,
-            pick: it.pick,
-            stake: it.stake,
-            exactHome: it.exactHome,
-            exactAway: it.exactAway,
-          })),
-        });
+        const res = await Promise.race([
+          api('/predictions/bet-batch', {
+            bets: COUPON_ITEMS.map((it) => ({
+              fixtureId: it.fixtureId,
+              market: it.market,
+              pick: it.pick,
+              stake: it.stake,
+              exactHome: it.exactHome,
+              exactAway: it.exactAway,
+            })),
+          }),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('Сервер не ответил вовремя. Попробуйте ещё раз.')), 12000)
+          ),
+        ]);
         toast(res.message);
         COUPON_ITEMS = [];
-        renderPredictionsPage(app);
+        if (typeof res.coins === 'number') data.wallet.coins = res.coins;
+        if (Array.isArray(res.predictions) && res.predictions.length) {
+          data.myPredictions = [...res.predictions].reverse().concat(data.myPredictions || []);
+        }
+        renderPredictionsContent(app, data);
       } catch (err: any) {
-        toast(err?.message || 'Ошибка оформления купона', true);
+        const msg = err?.message || 'Ошибка оформления купона';
+        toast(msg, true);
+        if (statusEl) {
+          statusEl.textContent = msg;
+          statusEl.style.display = 'block';
+        }
         cpSubmit.disabled = false;
+        cpSubmit.textContent = origLabel;
       }
     };
   }
@@ -2555,7 +2698,7 @@ export async function renderPredictionsPage(app: HTMLElement) {
       const fid = (b as HTMLElement).dataset.toggleMk!;
       if (OPEN_MARKETS_FIXTURES.has(fid)) OPEN_MARKETS_FIXTURES.delete(fid);
       else OPEN_MARKETS_FIXTURES.add(fid);
-      renderPredictionsPage(app);
+      renderPredictionsContent(app, data);
     };
   });
 
@@ -2563,77 +2706,9 @@ export async function renderPredictionsPage(app: HTMLElement) {
     (b as HTMLButtonElement).onclick = () => {
       const ds = (b as HTMLElement).dataset;
       FIXTURE_ACTIVE_GROUP.set(ds.fxGroup!, ds.group || 'main');
-      renderPredictionsPage(app);
+      renderPredictionsContent(app, data);
     };
   });
-
-  // League actions
-  const lgCreate = document.getElementById('lg_create_btn');
-  if (lgCreate) {
-    lgCreate.onclick = async () => {
-      try {
-        const res = await api('/predictions/league/create', {
-          name: (document.getElementById('lg_name') as HTMLInputElement).value.trim(),
-          description: (document.getElementById('lg_desc') as HTMLInputElement).value.trim(),
-        });
-        toast(res.message);
-        SELECTED_LEAGUE_ID = res.league.id;
-        renderPredictionsPage(app);
-      } catch (err: any) {
-        toast(err?.message || 'Ошибка создания лиги', true);
-      }
-    };
-  }
-
-  const lgJoin = document.getElementById('lg_join_btn');
-  if (lgJoin) {
-    lgJoin.onclick = async () => {
-      try {
-        const res = await api('/predictions/league/join', {
-          codeOrId: (document.getElementById('lg_join_code') as HTMLInputElement).value.trim(),
-        });
-        toast(res.message);
-        SELECTED_LEAGUE_ID = res.leagueId;
-        renderPredictionsPage(app);
-      } catch (err: any) {
-        toast(err?.message || 'Лига не найдена', true);
-      }
-    };
-  }
-
-  app.querySelectorAll('[data-sel-lg]').forEach((b) => {
-    (b as HTMLElement).onclick = () => {
-      SELECTED_LEAGUE_ID = (b as HTMLElement).dataset.selLg!;
-      renderPredictionsPage(app);
-    };
-  });
-
-  const lgLeave = document.getElementById('lg_leave_btn');
-  if (lgLeave) {
-    lgLeave.onclick = async () => {
-      try {
-        const res = await api('/predictions/league/leave', { leagueId: lgLeave.dataset.lid });
-        toast(res.message);
-        SELECTED_LEAGUE_ID = 'global';
-        renderPredictionsPage(app);
-      } catch (err: any) {
-        toast(err?.message || 'Ошибка', true);
-      }
-    };
-  }
-
-  const lgJoinDirect = document.getElementById('lg_join_direct');
-  if (lgJoinDirect) {
-    lgJoinDirect.onclick = async () => {
-      try {
-        const res = await api('/predictions/league/join', { codeOrId: lgJoinDirect.dataset.lid });
-        toast(res.message);
-        renderPredictionsPage(app);
-      } catch (err: any) {
-        toast(err?.message || 'Ошибка', true);
-      }
-    };
-  }
 }
 
 // ─── National Team Proposals & Voting Enhancement ─────────────────────────────

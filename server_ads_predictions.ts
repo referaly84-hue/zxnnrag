@@ -751,6 +751,37 @@ function findMarketOption(market: string, pick: string): { marketDef: Prediction
   return { marketDef: m, option: opt };
 }
 
+const BET_LOCK_BEFORE_MS = 2 * 60 * 1000;
+
+function getFixtureKickoffMs(f: any): number {
+  if (!f) return Number.NaN;
+  const hold = Number(f.hold);
+  if (Number.isFinite(hold) && hold > 0) return hold;
+  const rawD = String(f.realDate || f.date || '').trim();
+  const d = /^\d{4}-\d{2}-\d{2}$/.test(rawD) ? rawD : '';
+  if (!d) return Number.NaN;
+  const rawT = String(f.realTime || f.time || '12:00').trim();
+  let t = '12:00:00';
+  const m = rawT.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if (m) {
+    const hh = String(Math.min(23, Math.max(0, Number(m[1])))).padStart(2, '0');
+    const mm = String(Math.min(59, Math.max(0, Number(m[2])))).padStart(2, '0');
+    const ss = String(Math.min(59, Math.max(0, Number(m[3] || 0)))).padStart(2, '0');
+    t = `${hh}:${mm}:${ss}`;
+  }
+  const ms = new Date(`${d}T${t}+03:00`).getTime();
+  return Number.isFinite(ms) ? ms : Number.NaN;
+}
+
+function getFixtureBetLockInfo(f: any, nowMs = Date.now()): { kickoffAt: number | null; betCloseAt: number | null; locked: boolean } {
+  const kickoffMs = getFixtureKickoffMs(f);
+  const kickoffAt = Number.isFinite(kickoffMs) ? kickoffMs : null;
+  const betCloseAt = kickoffAt !== null ? kickoffAt - BET_LOCK_BEFORE_MS : null;
+  const statusLocked = !f || f.status !== 'scheduled';
+  const timeLocked = betCloseAt !== null && nowMs >= betCloseAt;
+  return { kickoffAt, betCloseAt, locked: statusLocked || timeLocked };
+}
+
 function clampNum(v: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, v));
 }
@@ -3477,10 +3508,17 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
   app.get('/api/predictions', (req: any, res) => {
     const db = ctx.getDb();
     const season = ctx.S();
+    const now = Date.now();
 
-    // Ensure any recently finished matches settle pending predictions
-    for (const f of db.fixtures || []) {
-      if (f.status === 'done') settlePredictionsForFixture(ctx, f);
+    // Ensure any recently finished matches settle pending predictions (only scan fixtures that actually have pending bets)
+    const pendingFixIds = new Set<string>();
+    for (const p of Array.isArray(db.predictions) ? db.predictions : []) {
+      if (p && p.status === 'pending' && p.fixtureId) pendingFixIds.add(p.fixtureId);
+    }
+    if (pendingFixIds.size > 0) {
+      for (const f of db.fixtures || []) {
+        if (f.status === 'done' && pendingFixIds.has(f.id)) settlePredictionsForFixture(ctx, f);
+      }
     }
 
     const hints = extractTgHintsFromReq(ctx, req);
@@ -3493,11 +3531,21 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
     const blocks = getAdsgramBlocks(db);
 
     const openFixtures = (db.fixtures || [])
-      .filter((f: any) => (f.season || season) === season && f.status === 'scheduled' && (f.comp === 'rpl' || f.comp === 'cup' || f.comp === 'supercup' || f.comp === 'friendly_match'))
-      .sort((a: any, b: any) => String(a.date || '').localeCompare(String(b.date || '')) || String(a.time || '').localeCompare(String(b.time || '')))
+      .filter((f: any) => {
+        if ((f.season || season) !== season) return false;
+        if (f.comp !== 'rpl' && f.comp !== 'cup' && f.comp !== 'supercup' && f.comp !== 'friendly_match') return false;
+        return !getFixtureBetLockInfo(f, now).locked;
+      })
+      .sort((a: any, b: any) => {
+        const ka = getFixtureKickoffMs(a);
+        const kb = getFixtureKickoffMs(b);
+        if (Number.isFinite(ka) && Number.isFinite(kb) && ka !== kb) return ka - kb;
+        return String(a.date || '').localeCompare(String(b.date || '')) || String(a.time || '').localeCompare(String(b.time || ''));
+      })
       .slice(0, 32)
       .map((f: any) => {
         const fxLine = computeFixtureMarkets(ctx, f);
+        const lockInfo = getFixtureBetLockInfo(f, now);
         return {
           id: f.id,
           comp: f.comp,
@@ -3508,6 +3556,8 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
           time: f.gameTime || f.time || '19:00',
           realDate: f.realDate || f.date,
           realTime: f.realTime || f.time || '19:00',
+          realStartAt: lockInfo.kickoffAt,
+          betCloseAt: lockInfo.betCloseAt,
           homeId: f.home,
           awayId: f.away,
           homeName: ctx.tn(f.home),
@@ -3545,24 +3595,7 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
       });
 
     const leaderboard = computePredictionLeaderboard(ctx, season);
-
-    const leagues = (Array.isArray(db.predictionLeagues) ? db.predictionLeagues : []).map((lg: any) => {
-      const memberSet = new Set<string>(Array.isArray(lg.members) ? lg.members : []);
-      const board = computePredictionLeaderboard(ctx, season, memberSet);
-      return {
-        id: lg.id,
-        name: lg.name,
-        description: lg.description || '',
-        code: lg.code,
-        isPublic: lg.isPublic !== false,
-        ownerKey: lg.ownerKey,
-        isMember: memberSet.has(actor.actorKey),
-        membersCount: memberSet.size,
-        leaderboard: board,
-      };
-    });
-
-    const now = Date.now();
+    const leagues: any[] = [];
     const offerMeta = [
       { blockKey: 'coins_short', blockId: blocks.coins_short, label: 'Быстрый пас', durationHint: '5 сек', rewardCoins: 1, maxViews: PREDICTION_AD_MAX_PER_CYCLE, isBotAd: false },
       { blockKey: 'coins_banner', blockId: blocks.coins_banner, label: 'Щит у поля', durationHint: 'баннер', rewardCoins: 2, maxViews: PREDICTION_AD_MAX_PER_CYCLE, isBotAd: false },
@@ -3661,6 +3694,9 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
       const f = (db.fixtures || []).find((x: any) => x.id === fixtureId);
       if (!f) return { ok: false as const, error: 'Один из матчей не найден.' };
       if (f.status !== 'scheduled') return { ok: false as const, error: `Приём ставок на матч «${ctx.tn(f.home)} — ${ctx.tn(f.away)}» уже закрыт.` };
+      if (getFixtureBetLockInfo(f).locked) {
+        return { ok: false as const, error: `Приём ставок на матч «${ctx.tn(f.home)} — ${ctx.tn(f.away)}» завершается за 2 минуты до начала.` };
+      }
 
       const rawEh = item?.exactHome;
       const rawEa = item?.exactAway;
