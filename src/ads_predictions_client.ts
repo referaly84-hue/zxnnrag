@@ -1902,7 +1902,7 @@ function renderPredictionsContent(app: HTMLElement, data: any) {
                 if (r.teamName) subBits.push(r.teamName);
                 if (r.telegramUsername) subBits.push(`@${r.telegramUsername}`);
                 const subText = subBits.join(' · ') || 'Участник';
-                const isMe = r.actorKey === data.actorKey;
+                const isMe = r.actorKey === data.actorKey || (Array.isArray(r.aliasActorKeys) && r.aliasActorKeys.includes(data.actorKey));
                 const valHtml = focusCol === 'correct'
                   ? `<td style="color:#15803d;font-weight:700">${r.correct}</td>`
                   : focusCol === 'wrong'

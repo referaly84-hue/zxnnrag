@@ -2294,11 +2294,70 @@ export function computePredictionLeaderboard(ctx: AdServerContext, season: strin
   const preds = (Array.isArray(db.predictions) ? db.predictions : []).filter((p: any) => p.season === season);
   const wallets = db.predictionWallets || {};
   const profiles = db.ownerProfiles || {};
+  const tgLinks = db.telegramClubLinks || {};
+
+  // Build canonical identity mapping so a Telegram user with both user:tg_... and club:... (or admin:...) is never duplicated
+  const tgIdToClubKey = new Map<string, string>();
+  const usernameToClubKey = new Map<string, string>();
+  const tgIdToAdminKey = new Map<string, string>();
+  const usernameToAdminKey = new Map<string, string>();
+
+  for (const [tgKey, tid] of Object.entries(tgLinks)) {
+    const cleanTg = String(tgKey || '').replace(/^tg_/, '').replace(/[^0-9]/g, '');
+    if (cleanTg && typeof tid === 'string' && ctx.team(tid)) {
+      tgIdToClubKey.set(cleanTg, `club:${tid}`);
+    }
+  }
+  for (const [k, p] of Object.entries(profiles) as Array<[string, any]>) {
+    if (!p || typeof p !== 'object') continue;
+    const tgId = String(p.telegramId || '').replace(/[^0-9]/g, '');
+    const uname = String(p.telegramUsername || '').trim().toLowerCase();
+    if (k.startsWith('club:')) {
+      if (tgId && !tgIdToClubKey.has(tgId)) tgIdToClubKey.set(tgId, k);
+      if (uname && !usernameToClubKey.has(uname)) usernameToClubKey.set(uname, k);
+    } else if (k.startsWith('admin:')) {
+      if (tgId && !tgIdToAdminKey.has(tgId)) tgIdToAdminKey.set(tgId, k);
+      if (uname && !usernameToAdminKey.has(uname)) usernameToAdminKey.set(uname, k);
+    }
+  }
+
+  const canonicalActorKey = (rawKey: string): string => {
+    if (!rawKey) return rawKey;
+    if (rawKey.startsWith('club:') || rawKey.startsWith('admin:')) return rawKey;
+    const prof = profiles[rawKey];
+    const tgId = String(
+      prof?.telegramId || (rawKey.startsWith('user:tg_') ? rawKey.slice(8) : '')
+    ).replace(/[^0-9]/g, '');
+    const uname = String(prof?.telegramUsername || '').trim().toLowerCase();
+    if (tgId && tgIdToClubKey.has(tgId)) return tgIdToClubKey.get(tgId)!;
+    if (uname && usernameToClubKey.has(uname)) return usernameToClubKey.get(uname)!;
+    if (tgId && tgIdToAdminKey.has(tgId)) return tgIdToAdminKey.get(tgId)!;
+    if (uname && usernameToAdminKey.has(uname)) return usernameToAdminKey.get(uname)!;
+    if (tgId && profiles[`user:tg_${tgId}`]) return `user:tg_${tgId}`;
+    return rawKey;
+  };
 
   const map = new Map<string, any>();
-  const ensureEntry = (actorKey: string) => {
-    if (map.has(actorKey)) return map.get(actorKey);
-    const prof = ensureOwnerProfile(ctx, actorKey);
+  const ensureEntry = (rawActorKey: string) => {
+    const actorKey = canonicalActorKey(rawActorKey);
+    if (map.has(actorKey)) {
+      const existing = map.get(actorKey);
+      if (rawActorKey !== actorKey && !existing.aliasSet.has(rawActorKey)) {
+        existing.aliasSet.add(rawActorKey);
+        existing.coins = Math.max(existing.coins, Number(wallets[rawActorKey]?.coins ?? 0));
+      }
+      return existing;
+    }
+    const rawProf = rawActorKey !== actorKey ? profiles[rawActorKey] : null;
+    const prof = ensureOwnerProfile(
+      ctx,
+      actorKey,
+      rawProf?.displayName,
+      rawProf?.photoUrl,
+      rawProf?.telegramId || rawProf?.telegramUsername
+        ? { tgId: rawProf.telegramId || undefined, username: rawProf.telegramUsername || undefined }
+        : undefined
+    );
     const tid = prof.teamId || (actorKey.startsWith('club:') ? actorKey.slice(5) : null);
     const t = tid ? ctx.team(tid) : null;
     const favT = prof.favoriteTeamId ? ctx.team(prof.favoriteTeamId) : null;
@@ -2308,6 +2367,7 @@ export function computePredictionLeaderboard(ctx: AdServerContext, season: strin
     ).length;
     const entry = {
       actorKey,
+      aliasSet: new Set<string>([actorKey, rawActorKey]),
       profileKind,
       displayName: prof.displayName || (t ? `Владелец ФК «${t.name}»` : 'Зритель РПЛ'),
       photoUrl: prof.photoUrl || '',
@@ -2325,24 +2385,25 @@ export function computePredictionLeaderboard(ctx: AdServerContext, season: strin
       kpd: 0,
       points: 0,
       coinsWon: 0,
-      coins: Number(wallets[actorKey]?.coins ?? STARTER_COINS),
+      coins: Number(wallets[actorKey]?.coins ?? wallets[rawActorKey]?.coins ?? STARTER_COINS),
     };
     map.set(actorKey, entry);
     return entry;
   };
 
   for (const key of Object.keys(wallets)) {
-    if (!filterMembers || filterMembers.has(key)) ensureEntry(key);
+    if (!filterMembers || filterMembers.has(key) || filterMembers.has(canonicalActorKey(key))) ensureEntry(key);
   }
   for (const key of Object.keys(profiles)) {
-    if (!filterMembers || filterMembers.has(key)) ensureEntry(key);
+    if (!filterMembers || filterMembers.has(key) || filterMembers.has(canonicalActorKey(key))) ensureEntry(key);
   }
   if (filterMembers) {
     for (const key of filterMembers) ensureEntry(key);
   }
 
   for (const p of preds) {
-    if (filterMembers && !filterMembers.has(p.actorKey)) continue;
+    const canon = canonicalActorKey(p.actorKey);
+    if (filterMembers && !filterMembers.has(p.actorKey) && !filterMembers.has(canon)) continue;
     const row = ensureEntry(p.actorKey);
     if (p.status === 'won') {
       row.correct++;
@@ -2358,8 +2419,9 @@ export function computePredictionLeaderboard(ctx: AdServerContext, season: strin
     }
   }
 
-  const list = Array.from(map.values()).map((r) => ({
+  const list = Array.from(map.values()).map(({ aliasSet, ...r }) => ({
     ...r,
+    aliasActorKeys: Array.from(aliasSet),
     kpd: r.total > 0 ? Math.round((r.correct / r.total) * 1000) / 10 : 0,
   }));
 
@@ -3528,26 +3590,34 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
       updatedAt: new Date().toISOString(),
     };
 
-    // Always ensure spectator profile for this Telegram user
-    const specProf = ensureOwnerProfile(ctx, `user:${tgKey}`, parsed.displayName, parsed.photoUrl, {
-      tgId: parsed.tgId,
-      username: parsed.username,
-    });
-
-    // If user is currently logged into a club, link Telegram and sync name/photo to Club Owner Profile
+    // Determine club link before creating any duplicate spectator profile
     db.telegramClubLinks ||= {};
     let activeTeamId: string | null = null;
+    let clubProf: any = null;
     if (req.me?.role === 'club' && req.me.teamId) {
       activeTeamId = req.me.teamId;
       db.telegramClubLinks[tgKey] = activeTeamId;
-      ensureOwnerProfile(ctx, `club:${activeTeamId}`, parsed.displayName, parsed.photoUrl, {
+      clubProf = ensureOwnerProfile(ctx, `club:${activeTeamId}`, parsed.displayName, parsed.photoUrl, {
         tgId: parsed.tgId,
         username: parsed.username,
       });
     } else if (db.telegramClubLinks[tgKey]) {
       const linkedTid = db.telegramClubLinks[tgKey];
-      if (ctx.team(linkedTid)) activeTeamId = linkedTid;
+      if (ctx.team(linkedTid)) {
+        activeTeamId = linkedTid;
+        clubProf = ensureOwnerProfile(ctx, `club:${activeTeamId}`, parsed.displayName, parsed.photoUrl, {
+          tgId: parsed.tgId,
+          username: parsed.username,
+        });
+      }
     }
+
+    const specProf = clubProf
+      ? (db.ownerProfiles?.[`user:${tgKey}`] || clubProf)
+      : ensureOwnerProfile(ctx, `user:${tgKey}`, parsed.displayName, parsed.photoUrl, {
+          tgId: parsed.tgId,
+          username: parsed.username,
+        });
 
     ctx.save();
     res.json({
@@ -3568,7 +3638,7 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
       username: hints.username,
     });
     const board = computePredictionLeaderboard(ctx, ctx.S());
-    const stats = board.find((x) => x.actorKey === actor.actorKey) || {
+    const stats = board.find((x) => x.actorKey === actor.actorKey || (Array.isArray(x.aliasActorKeys) && x.aliasActorKeys.includes(actor.actorKey))) || {
       rank: null,
       correct: 0,
       wrong: 0,
@@ -3598,7 +3668,7 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
     const db = ctx.getDb();
     const prof = ensureOwnerProfile(ctx, targetKey);
     const board = computePredictionLeaderboard(ctx, ctx.S());
-    const stats = board.find((x) => x.actorKey === targetKey) || {
+    const stats = board.find((x) => x.actorKey === targetKey || (Array.isArray(x.aliasActorKeys) && x.aliasActorKeys.includes(targetKey))) || {
       rank: null,
       correct: 0,
       wrong: 0,
