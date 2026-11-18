@@ -1898,11 +1898,27 @@ function renderPredictionsContent(app: HTMLElement, data: any) {
             <tbody style="font-variant-numeric:tabular-nums">
               ${rows.map((r: any, idx: number) => {
                 const rank = idx + 1;
-                const subBits: string[] = [];
-                if (r.teamName) subBits.push(r.teamName);
-                if (r.telegramUsername) subBits.push(`@${r.telegramUsername}`);
-                const subText = subBits.join(' · ') || 'Участник';
                 const isMe = r.actorKey === data.actorKey || (Array.isArray(r.aliasActorKeys) && r.aliasActorKeys.includes(data.actorKey));
+                const subBits: string[] = [];
+                if (r.teamName) {
+                  subBits.push(
+                    `<span style="display:inline-flex;align-items:center;gap:4px;vertical-align:middle">${
+                      r.teamLogo
+                        ? `<img src="${e(r.teamLogo)}" alt="" style="width:14px;height:14px;object-fit:contain;flex-shrink:0;border-radius:2px">`
+                        : ''
+                    }<span>${e(r.teamName)}</span></span>`
+                  );
+                }
+                if (r.telegramUsername) {
+                  subBits.push(`<span>@${e(r.telegramUsername)}</span>`);
+                }
+                const subHtml = subBits.length
+                  ? subBits.join('<span style="opacity:0.55">·</span>')
+                  : '<span>Участник</span>';
+                const initialChar = e((String(r.displayName || 'У').replace(/^@/, '') || 'У').slice(0, 1).toUpperCase());
+                const avatarHtml = r.photoUrl
+                  ? `<img src="${e(r.photoUrl)}" alt="" referrerpolicy="no-referrer" style="width:32px;height:32px;border-radius:50%;object-fit:cover;flex-shrink:0;border:1px solid var(--line)" onerror="this.style.display='none';if(this.nextElementSibling)this.nextElementSibling.style.display='flex'"><div style="width:32px;height:32px;border-radius:50%;background:var(--deep);color:#fff;display:none;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0">${initialChar}</div>`
+                  : `<div style="width:32px;height:32px;border-radius:50%;background:var(--deep);color:#fff;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0">${initialChar}</div>`;
                 const valHtml = focusCol === 'correct'
                   ? `<td style="color:#15803d;font-weight:700">${r.correct}</td>`
                   : focusCol === 'wrong'
@@ -1914,15 +1930,11 @@ function renderPredictionsContent(app: HTMLElement, data: any) {
                 <tr style="${isMe ? 'background:#f0fdf4;' : ''}">
                   <td><b>${rank <= 3 ? (rank === 1 ? '🥇' : rank === 2 ? '🥈' : '🥉') : rank}</b></td>
                   <td class="l">
-                    <div style="display:flex;align-items:center;gap:8px">
-                      ${r.photoUrl
-                        ? `<img src="${e(r.photoUrl)}" alt="" referrerpolicy="no-referrer" style="width:30px;height:30px;border-radius:50%;object-fit:cover;flex-shrink:0;border:1px solid var(--line)" onerror="this.style.display='none'">`
-                        : r.teamLogo
-                          ? `<img src="${e(r.teamLogo)}" alt="" style="width:28px;height:28px;object-fit:contain;flex-shrink:0">`
-                          : `<div style="width:30px;height:30px;border-radius:50%;background:var(--deep);color:#fff;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0">${e((r.displayName || 'У').slice(0, 1).toUpperCase())}</div>`}
-                      <div>
-                        <div style="font-weight:600">${e(r.displayName)}${isMe ? ' (вы)' : ''}${r.cups > 0 ? ` <span title="Кубок победителя Лиги прогнозов" style="margin-left:4px">🏆${r.cups > 1 ? '×' + r.cups : ''}</span>` : ''}</div>
-                        <div class="small muted">${e(subText)}</div>
+                    <div style="display:flex;align-items:center;gap:9px">
+                      ${avatarHtml}
+                      <div style="min-width:0">
+                        <div style="font-weight:600;line-height:1.25">${e(r.displayName)}${isMe ? ' (вы)' : ''}${r.cups > 0 ? ` <span title="Кубок победителя Лиги прогнозов" style="margin-left:4px">🏆${r.cups > 1 ? '×' + r.cups : ''}</span>` : ''}</div>
+                        <div class="small muted" style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:2px;line-height:1.2">${subHtml}</div>
                       </div>
                     </div>
                   </td>

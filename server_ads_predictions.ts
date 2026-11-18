@@ -1799,15 +1799,39 @@ export function ensureOwnerProfile(
   const teamId = isClub ? actorKey.slice(5) : null;
   const t = teamId ? ctx.team(teamId) : null;
 
-  // Also check stored Telegram user record if this is a user:tg_... actor or linked club
-  const tgKeyFromActor = actorKey.startsWith('user:tg_') ? actorKey.slice(5) : hintTg?.tgId ? `tg_${hintTg.tgId}` : '';
-  const tgRec = tgKeyFromActor ? db.telegramUsers?.[tgKeyFromActor] : null;
-  const effName = hintName || tgRec?.displayName || undefined;
-  const effPhoto = hintPhoto || tgRec?.photoUrl || undefined;
-  const effTgId = hintTg?.tgId || tgRec?.tgId || undefined;
-  const effTgUsername = hintTg?.username || tgRec?.username || undefined;
+  let existing = db.ownerProfiles[actorKey];
+  let linkedTgKey = '';
+  if (actorKey.startsWith('user:tg_')) {
+    linkedTgKey = actorKey.slice(5);
+  } else if (hintTg?.tgId) {
+    linkedTgKey = `tg_${hintTg.tgId}`;
+  } else if (existing?.telegramId) {
+    linkedTgKey = `tg_${existing.telegramId}`;
+  } else if (teamId && db.telegramClubLinks) {
+    for (const [k, tid] of Object.entries(db.telegramClubLinks)) {
+      if (tid === teamId) {
+        linkedTgKey = k;
+        break;
+      }
+    }
+  }
 
-  let prof = db.ownerProfiles[actorKey];
+  const tgRec = linkedTgKey ? db.telegramUsers?.[linkedTgKey] : null;
+  const specRec = linkedTgKey ? db.ownerProfiles?.[`user:${linkedTgKey}`] : null;
+  const isLegacyClubPlaceholder = (name: any) => typeof name === 'string' && /^Владелец ФК\b/.test(name.trim());
+  const cleanRealName = (name: any) => {
+    const s = String(name || '').trim();
+    if (!s || isLegacyClubPlaceholder(s) || s === 'Зритель РПЛ' || s === 'Участник') return '';
+    return s;
+  };
+
+  const effTgId = hintTg?.tgId || tgRec?.tgId || specRec?.telegramId || (linkedTgKey.startsWith('tg_') ? linkedTgKey.slice(3) : undefined) || undefined;
+  const effTgUsername = hintTg?.username || tgRec?.username || specRec?.telegramUsername || undefined;
+  const effName = cleanRealName(hintName) || cleanRealName(tgRec?.displayName) || cleanRealName(specRec?.displayName) || undefined;
+  const effPhoto = hintPhoto || tgRec?.photoUrl || specRec?.photoUrl || undefined;
+  const fallbackName = effTgUsername ? `@${effTgUsername}` : isAdmin ? 'Администратор лиги' : 'Участник';
+
+  let prof = existing;
   if (!prof) {
     prof = {
       actorKey,
@@ -1817,7 +1841,7 @@ export function ensureOwnerProfile(
       favoriteTeamId: null,
       telegramId: effTgId || null,
       telegramUsername: effTgUsername || '',
-      displayName: effName || (t ? `Владелец ФК «${t.name}»` : isAdmin ? 'Администратор лиги' : 'Зритель РПЛ'),
+      displayName: effName || fallbackName,
       photoUrl: effPhoto || '',
       bio: '',
       career: isClub && t ? `Руководство клубом «${t.name}» в лиге ${ctx.compName(t.comp || 'rpl')}.` : '',
@@ -1829,12 +1853,18 @@ export function ensureOwnerProfile(
     db.ownerProfiles[actorKey] = prof;
   } else {
     prof.profileKind = profileKind;
-    if (effTgId) prof.telegramId = effTgId;
-    if (effTgUsername) prof.telegramUsername = effTgUsername;
-    if (effName && !prof.customName) {
-      prof.displayName = effName;
+    if (effTgId && !prof.telegramId) prof.telegramId = effTgId;
+    if (effTgUsername && !prof.telegramUsername) prof.telegramUsername = effTgUsername;
+    if (!prof.customName) {
+      if (effName) {
+        prof.displayName = effName;
+      } else if (isLegacyClubPlaceholder(prof.displayName)) {
+        prof.displayName = fallbackName;
+      }
     }
-    if (effPhoto && !prof.customPhoto) {
+    if (effPhoto && !prof.customPhoto && !prof.photoUrl) {
+      prof.photoUrl = effPhoto;
+    } else if (effPhoto && !prof.customPhoto && (hintPhoto || tgRec?.photoUrl)) {
       prof.photoUrl = effPhoto;
     }
     if (teamId && !prof.teamId) prof.teamId = teamId;
@@ -2337,18 +2367,34 @@ export function computePredictionLeaderboard(ctx: AdServerContext, season: strin
     return rawKey;
   };
 
+  const isGenericDisplayName = (name: any) => {
+    const s = String(name || '').trim();
+    return !s || /^Владелец ФК\b/.test(s) || s === 'Зритель РПЛ' || s === 'Участник' || s === 'Администратор лиги';
+  };
+
   const map = new Map<string, any>();
   const ensureEntry = (rawActorKey: string) => {
     const actorKey = canonicalActorKey(rawActorKey);
+    const rawProf = rawActorKey !== actorKey ? profiles[rawActorKey] : null;
     if (map.has(actorKey)) {
       const existing = map.get(actorKey);
       if (rawActorKey !== actorKey && !existing.aliasSet.has(rawActorKey)) {
         existing.aliasSet.add(rawActorKey);
         existing.coins = Math.max(existing.coins, Number(wallets[rawActorKey]?.coins ?? 0));
       }
+      if (rawProf) {
+        if (isGenericDisplayName(existing.displayName) && !isGenericDisplayName(rawProf.displayName)) {
+          existing.displayName = rawProf.displayName;
+        }
+        if (!existing.photoUrl && rawProf.photoUrl) {
+          existing.photoUrl = rawProf.photoUrl;
+        }
+        if (!existing.telegramUsername && rawProf.telegramUsername) {
+          existing.telegramUsername = rawProf.telegramUsername;
+        }
+      }
       return existing;
     }
-    const rawProf = rawActorKey !== actorKey ? profiles[rawActorKey] : null;
     const prof = ensureOwnerProfile(
       ctx,
       actorKey,
@@ -2365,11 +2411,18 @@ export function computePredictionLeaderboard(ctx: AdServerContext, season: strin
     const cupCount = (Array.isArray(db.predictionSeasonAwards) ? db.predictionSeasonAwards : []).filter((aw: any) =>
       Array.isArray(aw?.winners) && aw.winners.some((w: any) => w.actorKey === actorKey && (w.hasCup || w.place === 1))
     ).length;
+    const cleanDisplayName = !isGenericDisplayName(prof.displayName)
+      ? prof.displayName
+      : prof.telegramUsername
+        ? `@${prof.telegramUsername}`
+        : profileKind === 'admin'
+          ? 'Администратор лиги'
+          : 'Участник';
     const entry = {
       actorKey,
       aliasSet: new Set<string>([actorKey, rawActorKey]),
       profileKind,
-      displayName: prof.displayName || (t ? `Владелец ФК «${t.name}»` : 'Зритель РПЛ'),
+      displayName: cleanDisplayName,
       photoUrl: prof.photoUrl || '',
       telegramUsername: prof.telegramUsername || '',
       teamId: tid,
